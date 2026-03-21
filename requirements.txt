@@ -6,3 +6,7 @@ wandb
 h5py
 pytest
 ultralytics
+transformers
+bitsandbytes
+accelerate
+sentencepiece

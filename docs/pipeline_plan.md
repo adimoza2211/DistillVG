@@ -65,19 +65,39 @@ This avoids a stale snapshot problem where proposal boxes or pseudo-labels would
 - Load the YOLO26 student and the rest of the trainable modules.
 - For each minibatch, generate proposals, crop the image, score crops with the verifier, and compute losses immediately.
 - Do not serialize verifier outputs as a training artifact.
-- Do not introduce HDF5 or other persistent pseudo-label caches.
+- Do not introduce HDF5 or other persistent pseudo-label cache
 
 Current code reality:
 - The trainer still runs a synthetic grounding scaffold.
 - The live online verifier pass is the target design, not yet the implemented training loop.
 - The student modules already exist, but the wiring between student proposals and verifier scoring is still pending.
 
-### Student-to-Verifier Supervision Contract
+### Student-to-Verifier Supervision Contract(VALOR)
 - The student produces candidate boxes and internal plausibility features.
 - The verifier evaluates the crop-text pair immediately.
 - The verifier logit is the online supervision signal, not a stored label.
 - The student’s own plausibility head learns to approximate the verifier signal while still respecting ground-truth box losses.
 - Only the student’s parameters participate in gradient updates.
+
+### Exact Implementation Details
+Instead of mathematically unstable feature-level distillation from massive 200M+ parameter models, we adopt a verifier-based distillation approach inspired by the VALOR framework and Zero-Shot Box Verification techniques.3 We utilize the highly capable, memory-efficient InternVL 3.5-8B (https://huggingface.co/OpenGVLab/InternVL3_5-8B) model (quantised), which easily fits within our 30GB VRAM budget.
+High-Recall Proposal Generation: The student backbone generates the top-200 candidate bounding boxes with intentionally lowered confidence thresholds to ensure maximum recall.
+Box-Wise Cropping: The high-resolution image is cropped using these bounding box coordinates to isolate specific target regions.
+VLM Verification Query: We feed these image crops alongside the Llama-generated paraphrases (including explicitly confusing hard-negative relational inversions) into the frozen InternVL 3.5-8B model. We prompt the VLM with a strict True/False query regarding whether the crop matches the text.
+Logit Extraction: Instead of raw text output, we extract the continuous logit distribution of the "True" token, providing a highly refined, scalar plausibility score.5 This completely bypasses the need to cache high-dimensional tensors and inherently eliminates cross-box interference.
+
+The student is designed to maximise accuracy within the latency constraint:
+Visual backbone: YOLO26-small (frozen, $\approx9.5M$ parameters). YOLO26 features a native end-to-end NMS-free inference architecture, guaranteeing strict, deterministic adherence to our sub-30 ms latency budget by eliminating post-processing bottlenecks.6 We extract the top-200 proposals using RoI-Align with $7\times7$ crops, projected to $d=384$.
+Text encoder: MobileCLIP-S1 text branch (frozen for epochs 1-5, then fine-tuned), projecting to $d=384$.
+Fusion transformer: 4 layers, $d=384$, 6 heads ($\approx7M$ parameters), with Token Blurring (ToB) merging applied after layer 2 to reduce active visual tokens from 200 to ~150.
+Re-ranking verifier head: A lightweight cross-attention module ($\approx0.4M$ parameters).
+
+
+### Implement Dynamic Weight-Balance Distillation (DWBD)
+ During your training phase, use the DWBD technique introduced in the SimVG architecture. Because there is a massive parameter gap between your 7M parameter fusion transformer and your 0.4M parameter verifier head, DWBD dynamically adjusts the distillation weights across epochs to prevent the smaller student head from underfitting the teacher's complex features early on.
+
+### Training Objective & Optimization
+ We optimize the network using the MuSGD optimizer, a hybrid of SGD and Muon, which ensures highly stable and rapid convergence within our strict 1-month timeframe. The loss function utilizes Dynamic Weight-Balance Distillation (DWBD) from the SimVG framework. Because there is a massive capacity mismatch between the 7M parameter fusion transformer and the 0.4M parameter verifier head, DWBD actively adjusts the weights assigned to the VLM teacher's logits and the ground-truth labels across epochs, preventing the smaller branch from underfitting early on. Finally, we integrate YOLO26's Small-Target-Aware Label Assignment (STAL) and Progressive Loss Balancing (ProgLoss) to handle small, dense referents effectively.
 
 ### Phase 2: Student Optimization
 - Update only trainable student parameters.
@@ -89,6 +109,12 @@ Current code reality:
 - Apply quantization-aware training.
 - Export the student to deployment targets.
 - Never export the verifier.
+
+  We apply structured pruning of the fusion transformer (20% FFN channel pruning), followed by 5 epochs of mixed-precision INT8 Quantization-Aware Training (QAT). Crucially, YOLO26 removes the Distribution Focal Loss (DFL) module, making its regression pipeline highly hardware-friendly. This ensures that our export via ONNX to TensorRT, CoreML, and Android NNAPI suffers minimal quantization degradation, maintaining high fidelity across FP16 and INT8 precincts.
+  Key Technical Novelties
+  NMS-Free Edge-Optimized Backbone: Utilizing YOLO26-small completely eliminates the Non-Maximum Suppression bottleneck, providing deterministic, constant-time inference critical for the <30 ms mobile NPU budget.
+  Verifier-Based Logit Distillation: Bypassing computationally heavy feature distillation by utilizing InternVL 3.5-8B as a zero-shot box verifier, transforming complex spatial alignment into a clean, scalar logit reward signal that fits into a 30GB VRAM footprint.
+  Dynamic Weight-Balance Distillation (DWBD): Implementing dynamic loss weighting to bridge the massive capacity gap
 
 ## Explicit Non-Goals
 - No teacher-feature cache.

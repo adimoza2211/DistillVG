@@ -19,3 +19,12 @@ training:
   lr: 0.001
   weight_decay: 0.0001
   device: auto
+
+verifier:
+  backend: internvl
+  model_id: OpenGVLab/InternVL3_5-8B
+  mock_hidden_dim: 64
+  crop_size: 64
+  use_augmented_queries: true
+  query_selection: first
+  augmented_phrase_glob: data/annotations/*/*_aug.pth

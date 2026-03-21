@@ -11,5 +11,6 @@ def collate_synthetic_batch(batch: list[Any]) -> dict[str, torch.Tensor]:
         "token_ids": torch.stack([sample.token_ids for sample in batch], dim=0),
         "attention_mask": torch.stack([sample.attention_mask for sample in batch], dim=0),
         "target_box": torch.stack([sample.target_box for sample in batch], dim=0),
-        "verifier_target": torch.stack([sample.verifier_target for sample in batch], dim=0),
+        "phrases": [sample.phrase for sample in batch],
+        "augmented_phrases": [sample.augmented_phrases for sample in batch],
     }

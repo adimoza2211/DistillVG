@@ -3,16 +3,23 @@ from __future__ import annotations
 import torch
 
 from src.models.losses import LossOutput, compute_distillation_losses
+from src.models.verifier.prompting import build_verifier_queries
+from src.models.verifier.runtime import BaseOnlineVerifier
+from src.training.verifier_crops import crop_and_resize_from_boxes, normalize_predicted_boxes
 
 
 def run_distillation_step(
     model: torch.nn.Module,
-    batch: dict[str, torch.Tensor],
-    scaler: torch.cuda.amp.GradScaler,
+    online_verifier: BaseOnlineVerifier,
+    batch: dict[str, torch.Tensor | list[str] | list[tuple[str, ...]]],
+    scaler: torch.amp.GradScaler,
     device: torch.device,
     use_amp: bool,
     grad_accum_steps: int,
     loss_weights: dict[str, float],
+    verifier_crop_size: int,
+    use_augmented_verifier_queries: bool,
+    verifier_query_selection: str,
 ) -> LossOutput:
     images = batch["images"].to(device, non_blocking=True)
     token_ids = batch["token_ids"].to(device, non_blocking=True)
@@ -20,7 +27,12 @@ def run_distillation_step(
     aug_token_ids = batch.get("aug_token_ids")
     aug_attention_mask = batch.get("aug_attention_mask")
     target_box = batch["target_box"].to(device, non_blocking=True)
-    verifier_target = batch["verifier_target"].to(device, non_blocking=True)
+    phrases = list(batch.get("phrases", []))
+    augmented_phrases = batch.get("augmented_phrases")
+    if augmented_phrases is None:
+        augmented_phrase_sets: list[tuple[str, ...]] | None = None
+    else:
+        augmented_phrase_sets = list(augmented_phrases)
     teacher_logits = batch.get("logits")
     teacher_proposal_feats = batch.get("proposal_feats")
     teacher_pooled_embed = batch.get("pooled_embed")
@@ -49,6 +61,26 @@ def run_distillation_step(
 
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
         outputs = model(images=images, token_ids=token_ids, attention_mask=attention_mask)
+        proposal_boxes = normalize_predicted_boxes(outputs["bbox"].detach())
+        crops = crop_and_resize_from_boxes(
+            images=images.detach(),
+            boxes_xyxy=proposal_boxes,
+            output_size=verifier_crop_size,
+        )
+
+        with torch.no_grad():
+            verifier_queries = build_verifier_queries(
+                base_phrases=phrases,
+                augmented_phrase_sets=augmented_phrase_sets,
+                use_augmented=use_augmented_verifier_queries,
+                selection_strategy=verifier_query_selection,
+            )
+            online_verifier_logits = online_verifier(
+                crops=crops,
+                queries=verifier_queries,
+            )
+        verifier_target = torch.sigmoid(online_verifier_logits).to(outputs["verifier_logit"].dtype)
+
         augmented_student_tokens = None
         if aug_token_ids is not None and aug_attention_mask is not None:
             batch_size, aug_count, seq_len = aug_token_ids.shape

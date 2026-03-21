@@ -32,6 +32,7 @@ The target system is online distillation. Do not introduce persistent verifier c
 - Add or update unit tests for every new module or changed behavior.
 - For running stuff in cli, always do conda activate distill first
 - Use modern pytorch features like Amp or any other modern deep learning concepts that will decrease inference or training time WITHOUT any sacrifice to performance
+- As you start solidifying components, keep removing fallbacks to ensure correctness. 
 
 ## Architecture Constraints
 

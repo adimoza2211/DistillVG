@@ -7,8 +7,10 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
 from src.data.collate import collate_synthetic_batch
+from src.data.phrase_bank import load_phrase_bank_from_augmented_pth
 from src.data.synthetic import SyntheticGroundingDataset
 from src.models.student.model import StudentModel
+from src.models.verifier.runtime import BaseOnlineVerifier, build_online_verifier
 from src.training.distill import run_distillation_step
 from src.utils.logging import get_logger
 from src.utils.seed import set_seed
@@ -41,11 +43,19 @@ class Trainer:
     def _build_dataloader(self) -> DataLoader:
         training_cfg = self.cfg.training
         samples = int(training_cfg.steps_per_epoch) * int(training_cfg.micro_batch_size)
+        phrase_bank_pattern = str(self.cfg.verifier.augmented_phrase_glob)
+        phrase_bank = load_phrase_bank_from_augmented_pth(pattern=phrase_bank_pattern)
+        if phrase_bank:
+            self.logger.info("Loaded %d augmented phrase records from pattern: %s", len(phrase_bank), phrase_bank_pattern)
+        else:
+            self.logger.warning("No augmented phrase records matched pattern: %s", phrase_bank_pattern)
+
         dataset = SyntheticGroundingDataset(
             num_samples=samples,
             image_size=int(training_cfg.image_size),
             seq_len=int(training_cfg.seq_len),
             vocab_size=int(training_cfg.vocab_size),
+            phrase_bank=phrase_bank,
         )
         return DataLoader(
             dataset,
@@ -81,6 +91,9 @@ class Trainer:
         ]
         return torch.optim.AdamW(trainable_groups, weight_decay=float(training_cfg.weight_decay))
 
+    def _build_online_verifier(self) -> BaseOnlineVerifier:
+        return build_online_verifier(cfg=self.cfg.verifier, device=self.device)
+
     def _apply_epoch_trainability(self, model: StudentModel, epoch_index: int) -> None:
         model.backbone.eval()
         for parameter in model.backbone.parameters():
@@ -115,6 +128,7 @@ class Trainer:
 
     def train(self) -> None:
         model = self._build_model()
+        online_verifier = self._build_online_verifier()
         dataloader = self._build_dataloader()
         optimizer = self._build_optimizer(model)
 
@@ -150,12 +164,16 @@ class Trainer:
             for step, batch in enumerate(dataloader, start=1):
                 losses = run_distillation_step(
                     model=model,
+                    online_verifier=online_verifier,
                     batch=batch,
                     scaler=scaler,
                     device=self.device,
                     use_amp=use_amp,
                     grad_accum_steps=grad_accum_steps,
                     loss_weights=loss_weights,
+                    verifier_crop_size=int(self.cfg.verifier.crop_size),
+                    use_augmented_verifier_queries=bool(self.cfg.verifier.use_augmented_queries),
+                    verifier_query_selection=str(self.cfg.verifier.query_selection),
                 )
 
                 if step % grad_accum_steps == 0:

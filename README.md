@@ -18,14 +18,18 @@ What is already established:
 - The distillation trainer lives in [src/training/trainer.py](src/training/trainer.py).
 - The student loss stack is in [src/models/losses.py](src/models/losses.py).
 - The student implementation is split across [src/models/student/model.py](src/models/student/model.py), [src/models/student/backbone.py](src/models/student/backbone.py), [src/models/student/text_encoder.py](src/models/student/text_encoder.py), [src/models/student/fusion.py](src/models/student/fusion.py), and [src/models/student/verifier.py](src/models/student/verifier.py).
-- The current training code is still a synthetic scaffold; the online verifier step is not wired into the trainer yet.
+- Phase 1 has started: the trainer now builds a frozen online verifier module and computes verifier supervision inside each training step.
+- The distillation step now converts student-predicted boxes into online crops and scores them with a frozen verifier path.
+- Verifier backend is now configured InternVL-first in Hydra, with explicit 4-bit loading scaffolding.
+- Verifier query text now pulls augmentation candidates from `_aug.pth` files and constructs True/False crop-matching prompts.
+- The phrase-bank parser is now aligned to the real `_aug.pth` tuple contract (paraphrases from slot index `3`).
 - The repo already has a Hydra-based configuration layout under [configs/](configs/).
 - There are working scene-graph extraction and integrity-check scripts: [scripts/extract_scene_graphs.py](scripts/extract_scene_graphs.py) and [scripts/verify_augmentation_integrity.py](scripts/verify_augmentation_integrity.py).
 
 What is still legacy or inconsistent with the target design:
-- The old cache precompute and teacher-wrapper code have been removed.
-- The trainer still needs to be rewired from the synthetic scaffold to the live verifier path.
-- The student-side wiring and losses still need to be connected to the actual online verifier execution.
+- The active dataloader path is still synthetic and not yet connected to the real grounding dataset pipeline.
+- The InternVL backend path is scaffolded for 4-bit loading, but generation-logit extraction for True/False supervision is still pending.
+- The training objective still contains legacy placeholder loss inputs that should be replaced with real proposal-level verifier supervision.
 
 What the target runtime is supposed to be:
 - A YOLO26-small student produces proposal boxes in the forward pass.
@@ -48,6 +52,7 @@ What this means operationally:
 - There is no offline HDF5 pseudo-label store in the target pipeline.
 - Candidate boxes are generated and consumed inside the same step.
 - Any reuse is in-memory within the batch/step, not a disk-backed artifact.
+- Local debugging can still use a mock verifier via Hydra override: `verifier.backend=mock`.
 
 ## Current Repo Layout
 
@@ -60,7 +65,7 @@ Relevant code areas:
 - [configs/](configs/) for Hydra configuration
 - [scripts/](scripts/) for entrypoints
 - [src/data/](src/data/) for augmentation and dataset plumbing
-- [src/models/](src/models/) for student, verifier, and loss code
+- [src/models/](src/models/) for student, verifier runtime, and loss code
 - [src/training/](src/training/) for the training loop and distillation step
 - [tests/](tests/) for unit coverage
 
@@ -78,13 +83,13 @@ Legacy files that should not define the target architecture anymore:
 - None at the moment; the cache-oriented code was pruned in this pass.
 
 ## Immediate Next Work
-- Rewire training so verifier scoring happens online in the same forward pass.
-- Make the verifier loading path 4-bit and VRAM-resident.
-- Replace the synthetic trainer scaffold with the real live-verifier path.
-- Keep pruning dead code as each replaced subsystem becomes obsolete.
+- Replace synthetic data loading with real grounding minibatches that carry verifier-ready text prompts.
+- Complete the InternVL scoring bridge for crop+prompt True/False logit extraction.
+- Upgrade from single-box online scoring to proposal-set scoring and ranking supervision.
+- Remove legacy placeholder distillation inputs once proposal-level verifier logits are active.
 
 ## Short Version
 
 The repo is no longer being documented as a cache-first pipeline.
 The intended design is online distillation with simultaneous student and verifier execution.
-The current code still contains a synthetic training scaffold that must be replaced by the live verifier path.
+The current code now includes an initial online verifier scaffold in the training step, but still needs real-data and InternVL scoring completion to match the full target runtime contract.
