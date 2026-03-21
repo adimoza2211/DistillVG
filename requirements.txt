@@ -1,0 +1,8 @@
+torch
+torchvision
+hydra-core
+omegaconf
+wandb
+h5py
+pytest
+ultralytics

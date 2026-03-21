@@ -1,0 +1,5 @@
+hidden_dim: 384
+fusion_layers: 4
+attention_heads: 6
+roi_tokens: 200
+tob_tokens: 150

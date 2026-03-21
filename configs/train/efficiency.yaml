@@ -1,0 +1,5 @@
+amp: true
+grad_accum_steps: 2
+grad_clip_norm: 1.0
+activation_checkpointing: false
+torch_compile: false

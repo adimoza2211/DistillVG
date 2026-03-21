@@ -1,0 +1,7 @@
+# Scene Graph Augmentation config
+# The pipeline relies on _aug.pth files statically generated per split.
+# Number of synthetic pairs attached to each sample is fixed to 3 during Phase 0 prep.
+
+use_augmentations: true
+aug_queries_per_sample: 3
+fallback_to_padding: true
