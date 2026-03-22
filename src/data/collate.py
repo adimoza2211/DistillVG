@@ -5,7 +5,7 @@ from typing import Any
 import torch
 
 
-def collate_synthetic_batch(batch: list[Any]) -> dict[str, torch.Tensor]:
+def collate_grounding_batch(batch: list[Any]) -> dict[str, torch.Tensor | list[str] | list[tuple[str, ...]]]:
     return {
         "images": torch.stack([sample.image for sample in batch], dim=0),
         "token_ids": torch.stack([sample.token_ids for sample in batch], dim=0),
@@ -14,3 +14,6 @@ def collate_synthetic_batch(batch: list[Any]) -> dict[str, torch.Tensor]:
         "phrases": [sample.phrase for sample in batch],
         "augmented_phrases": [sample.augmented_phrases for sample in batch],
     }
+
+
+collate_synthetic_batch = collate_grounding_batch

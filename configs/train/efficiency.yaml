@@ -1,5 +1,31 @@
 amp: true
-grad_accum_steps: 2
+grad_accum_steps: 16
 grad_clip_norm: 1.0
 activation_checkpointing: false
 torch_compile: false
+mode: phase1
+optimizer: musgd
+
+musgd:
+  momentum: 0.95
+  muon_beta: 0.95
+  eps: 1.0e-8
+
+dwbd:
+  enabled: true
+  alpha_max: 0.8
+  alpha_min: 0.1
+  gamma: 2.0
+
+stal:
+  enabled: true
+  area_threshold: 0.05
+  max_boost: 1.5
+
+progloss:
+  enabled: true
+  box_start_scale: 0.9
+  box_end_scale: 1.1
+  verifier_start_scale: 1.1
+  verifier_end_scale: 0.9
+  power: 1.0

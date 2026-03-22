@@ -35,3 +35,15 @@ def build_verifier_queries(
         queries.append(prompt)
 
     return queries
+
+
+def build_stage2_verifier_queries(phrases: list[str], top_k: int) -> list[str]:
+    queries: list[str] = []
+    for phrase in phrases:
+        prompt = (
+            f"The red rectangle in this image highlights a specific region. "
+            f"How well does the highlighted region match the expression '{phrase}'? "
+            "Answer with exactly one word from: Excellent, Good, Partial, No."
+        )
+        queries.extend([prompt] * top_k)
+    return queries

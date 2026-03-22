@@ -16,20 +16,29 @@ What is already established:
 - Deterministic scene-graph augmentation is the active Phase 0 direction.
 - The student training entrypoint exists at [scripts/train.py](scripts/train.py).
 - The distillation trainer lives in [src/training/trainer.py](src/training/trainer.py).
-- The student loss stack is in [src/models/losses.py](src/models/losses.py).
+- The active Phase-1/Phase-2 loss stack is now under [src/losses/](src/losses/) with combined loss composition in [src/losses/combined.py](src/losses/combined.py).
 - The student implementation is split across [src/models/student/model.py](src/models/student/model.py), [src/models/student/backbone.py](src/models/student/backbone.py), [src/models/student/text_encoder.py](src/models/student/text_encoder.py), [src/models/student/fusion.py](src/models/student/fusion.py), and [src/models/student/verifier.py](src/models/student/verifier.py).
 - Phase 1 has started: the trainer now builds a frozen online verifier module and computes verifier supervision inside each training step.
-- The distillation step now converts student-predicted boxes into online crops and scores them with a frozen verifier path.
+- The distillation step now converts student proposal boxes into online crops and scores top-K proposals with a frozen verifier path.
 - Verifier backend is now configured InternVL-first in Hydra, with explicit 4-bit loading scaffolding.
 - Verifier query text now pulls augmentation candidates from `_aug.pth` files and constructs True/False crop-matching prompts.
 - The phrase-bank parser is now aligned to the real `_aug.pth` tuple contract (paraphrases from slot index `3`).
+- The student now emits proposal-level boxes and proposal-level plausibility logits used for verifier-supervised ranking.
+- Proposal generation now uses an Ultralytics YOLO26-backed path for high-recall top-200 proposals.
+- Two-stage verifier utilities are now present (Stage-1 crop scoring + Stage-2 highlighted full-image 4-class scoring helpers).
+- The trainer dataloader now uses real image-backed `_aug.pth` records and no longer depends on the synthetic training scaffold.
+- The trainer dataloader now balances source splits using a `WeightedRandomSampler` built from `_aug.pth` sources.
+- The Phase 1 loss path is now aligned to live verifier supervision plus box losses (legacy placeholder feature-distillation terms removed).
+- Consistency loss now runs from student-only augmented-query forwards using fused-token representations.
+- Phase 2 has started with DWBD dynamic loss balancing and MuSGD optimizer support.
+- Phase 2 strict verifier-unloaded fine-tuning is now fully wired as `train.mode=phase2_strict` using only `L_box + L_cst`.
+- STAL small-target weighting and ProgLoss progressive scaling are now wired into both phase1 and phase2 loss composition via Hydra config.
 - The repo already has a Hydra-based configuration layout under [configs/](configs/).
 - There are working scene-graph extraction and integrity-check scripts: [scripts/extract_scene_graphs.py](scripts/extract_scene_graphs.py) and [scripts/verify_augmentation_integrity.py](scripts/verify_augmentation_integrity.py).
 
 What is still legacy or inconsistent with the target design:
-- The active dataloader path is still synthetic and not yet connected to the real grounding dataset pipeline.
-- The InternVL backend path is scaffolded for 4-bit loading, but generation-logit extraction for True/False supervision is still pending.
-- The training objective still contains legacy placeholder loss inputs that should be replaced with real proposal-level verifier supervision.
+- Training pipeline is launch-ready for Phase 1 and Phase 2.
+- Remaining work is Phase 3 only: compression, export, and deployment artifact validation.
 
 What the target runtime is supposed to be:
 - A YOLO26-small student produces proposal boxes in the forward pass.
@@ -83,13 +92,22 @@ Legacy files that should not define the target architecture anymore:
 - None at the moment; the cache-oriented code was pruned in this pass.
 
 ## Immediate Next Work
-- Replace synthetic data loading with real grounding minibatches that carry verifier-ready text prompts.
-- Complete the InternVL scoring bridge for crop+prompt True/False logit extraction.
-- Upgrade from single-box online scoring to proposal-set scoring and ranking supervision.
-- Remove legacy placeholder distillation inputs once proposal-level verifier logits are active.
+- Implement Phase 3 compression parity (structured pruning + QAT).
+- Implement and validate Phase 3 export parity (ONNX/TensorRT/CoreML student-only artifact).
+
+## Hyperparameters
+- The authoritative optimizer/schedule/loss/verifier/compression hyperparameter spec is maintained in [docs/pipeline_plan.md](docs/pipeline_plan.md) under **Hyperparameter Specification (Authoritative)**.
+
+## Start Training
+- Minimal smoke run (fast sanity check):
+	- `conda activate distill && python scripts/train.py verifier.backend=mock model.proposal_generator.use_yolo26=false training.epochs=1 training.max_records=8 training.micro_batch_size=2 data.num_workers=0 data.persistent_workers=false train.mode=phase1`
+- Full Phase 1 run (online InternVL verifier, YOLO26 proposals):
+	- `conda activate distill && python scripts/train.py`
+- Phase 2 strict fine-tuning run (verifier unloaded):
+	- `conda activate distill && python scripts/train.py train.mode=phase2_strict`
 
 ## Short Version
 
 The repo is no longer being documented as a cache-first pipeline.
 The intended design is online distillation with simultaneous student and verifier execution.
-The current code now includes an initial online verifier scaffold in the training step, but still needs real-data and InternVL scoring completion to match the full target runtime contract.
+Phase 1 online verifier-guided distillation is now implemented in-repo with real `_aug.pth` records, proposal-level top-K verifier scoring, and live verifier-supervised losses.

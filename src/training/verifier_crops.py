@@ -13,6 +13,14 @@ def normalize_predicted_boxes(pred_box: torch.Tensor) -> torch.Tensor:
     return torch.stack([x1, y1, x2, y2], dim=-1)
 
 
+def normalize_xyxy_boxes(boxes_xyxy: torch.Tensor) -> torch.Tensor:
+    x1 = torch.minimum(boxes_xyxy[..., 0], boxes_xyxy[..., 2]).clamp(0.0, 1.0)
+    y1 = torch.minimum(boxes_xyxy[..., 1], boxes_xyxy[..., 3]).clamp(0.0, 1.0)
+    x2 = torch.maximum(boxes_xyxy[..., 0], boxes_xyxy[..., 2]).clamp_min(x1 + 1e-4).clamp(max=1.0)
+    y2 = torch.maximum(boxes_xyxy[..., 1], boxes_xyxy[..., 3]).clamp_min(y1 + 1e-4).clamp(max=1.0)
+    return torch.stack([x1, y1, x2, y2], dim=-1)
+
+
 def crop_and_resize_from_boxes(images: torch.Tensor, boxes_xyxy: torch.Tensor, output_size: int) -> torch.Tensor:
     batch_size, _, height, width = images.shape
     crops: list[torch.Tensor] = []
@@ -39,3 +47,14 @@ def crop_and_resize_from_boxes(images: torch.Tensor, boxes_xyxy: torch.Tensor, o
         crops.append(resized)
 
     return torch.cat(crops, dim=0)
+
+
+def crop_and_resize_from_proposals(images: torch.Tensor, boxes_xyxy: torch.Tensor, output_size: int) -> torch.Tensor:
+    batch_size, proposal_count, _ = boxes_xyxy.shape
+    flattened_boxes = boxes_xyxy.reshape(batch_size * proposal_count, 4)
+    repeated_images = (
+        images.unsqueeze(1)
+        .expand(-1, proposal_count, -1, -1, -1)
+        .reshape(batch_size * proposal_count, images.shape[1], images.shape[2], images.shape[3])
+    )
+    return crop_and_resize_from_boxes(images=repeated_images, boxes_xyxy=flattened_boxes, output_size=output_size)

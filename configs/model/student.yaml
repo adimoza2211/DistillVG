@@ -3,3 +3,11 @@ fusion_layers: 4
 attention_heads: 6
 roi_tokens: 200
 tob_tokens: 150
+proposal_count: 200
+
+proposal_generator:
+  use_yolo26: true
+  yolo26_model_cfg: ""
+  yolo26_weights_path: ""
+  yolo26_conf_threshold: 0.001
+  yolo26_iou_threshold: 0.95

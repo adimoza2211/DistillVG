@@ -8,23 +8,31 @@ defaults:
 experiment: student_full
 seed: 42
 
+lambda1: 0.1
+lambda2: 1.0
+lambda3: 5.0
+
 training:
-  epochs: 2
+  epochs: 30
   steps_per_epoch: 12
   micro_batch_size: 4
+  max_records: 0
   hidden_dim: 256
   image_size: 64
   seq_len: 16
   vocab_size: 1024
-  lr: 0.001
-  weight_decay: 0.0001
+  lr: 3.0e-4
+  weight_decay: 0.05
   device: auto
 
 verifier:
   backend: internvl
   model_id: OpenGVLab/InternVL3_5-8B
+  image_root: data/datasets/other/images/mscoco/images/train2014
   mock_hidden_dim: 64
   crop_size: 64
+  top_k_proposals: 16
+  stage2_top_k: 5
   use_augmented_queries: true
   query_selection: first
   augmented_phrase_glob: data/annotations/*/*_aug.pth
