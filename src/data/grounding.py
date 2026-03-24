@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from glob import glob
+import hashlib
 from pathlib import Path
 import re
 
@@ -50,9 +51,15 @@ def _resolve_coco_name(image_name: str) -> str:
 
 def _encode_phrase_to_ids(phrase: str, seq_len: int, vocab_size: int) -> torch.Tensor:
     token_ids = torch.zeros(seq_len, dtype=torch.long)
+    if vocab_size <= 1:
+        return token_ids
+
+    token_space = vocab_size - 1
     words = phrase.lower().split()
     for index, word in enumerate(words[:seq_len]):
-        token_ids[index] = abs(hash(word)) % max(vocab_size, 2)
+        digest = hashlib.blake2b(word.encode("utf-8"), digest_size=8).digest()
+        stable_hash = int.from_bytes(digest, byteorder="little", signed=False)
+        token_ids[index] = 1 + (stable_hash % token_space)
     return token_ids
 
 
@@ -147,7 +154,8 @@ class AugmentedGroundingDataset(Dataset[GroundingSample]):
     def _resize_and_pad_image(self, image: Image.Image) -> tuple[torch.Tensor, float, int, int]:
         width, height = image.size
         long_edge = max(width, height)
-        scale = float(self.resize_long_edge) / float(max(long_edge, 1))
+        effective_long_edge = min(self.resize_long_edge, self.padded_square_size)
+        scale = float(effective_long_edge) / float(max(long_edge, 1))
 
         resized_width = max(1, int(round(width * scale)))
         resized_height = max(1, int(round(height * scale)))

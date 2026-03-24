@@ -4,6 +4,8 @@ import torch
 from omegaconf import OmegaConf
 
 from src.models.student.model import StudentModel
+from src.training.distill import DistillStepOutput
+import src.training.trainer as trainer_module
 from src.training.distill import run_phase2_finetune_step
 from src.training.trainer import Trainer
 
@@ -138,3 +140,74 @@ def test_trainer_rejects_unknown_mode() -> None:
     except ValueError:
         return
     raise AssertionError("Expected ValueError for unsupported mode")
+
+
+def test_trainer_flushes_residual_grad_accumulation(monkeypatch) -> None:
+    class TinyModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+    class CountingSGD(torch.optim.SGD):
+        def __init__(self, params, lr: float) -> None:
+            super().__init__(params, lr=lr)
+            self.step_count = 0
+
+        def step(self, closure=None):
+            self.step_count += 1
+            return super().step(closure)
+
+    cfg = OmegaConf.create(
+        {
+            "seed": 42,
+            "experiment": "grad_accum_flush",
+            "training": {
+                "device": "cpu",
+                "batch_size_per_gpu": 1,
+                "epochs": 1,
+                "text_vocab_size": 128,
+            },
+            "train": {
+                "mode": "phase2_strict",
+                "amp": False,
+                "amp_dtype": "fp16",
+                "grad_accum_steps": 2,
+                "grad_clip_norm": 1.0,
+                "lambda_l1": 1.0,
+                "lambda_giou": 1.0,
+                "lambda_ver": 1.0,
+                "stal": {"enabled": False, "area_threshold": 0.05, "max_boost": 1.0},
+                "progloss": {"enabled": False, "box_start_scale": 1.0, "box_end_scale": 1.0, "power": 1.0},
+            },
+            "lambda1": 0.1,
+            "lambda2": 1.0,
+            "lambda3": 1.0,
+        }
+    )
+    trainer = Trainer(cfg)
+    model = TinyModel()
+    optimizer_holder: dict[str, CountingSGD] = {}
+
+    monkeypatch.setattr(Trainer, "_build_model", lambda self: model.to(self.device))
+    monkeypatch.setattr(Trainer, "_build_dataloader", lambda self: [{}, {}, {}])
+    monkeypatch.setattr(Trainer, "_apply_epoch_trainability", lambda self, _model, _epoch: None)
+
+    def _build_optimizer_override(self, _model):
+        optimizer = CountingSGD(model.parameters(), lr=1e-2)
+        optimizer_holder["optimizer"] = optimizer
+        return optimizer
+
+    monkeypatch.setattr(Trainer, "_build_optimizer", _build_optimizer_override)
+
+    def _fake_phase2_step(**kwargs):
+        fake_loss = (model.weight ** 2).sum()
+        kwargs["scaler"].scale(fake_loss / kwargs["grad_accum_steps"]).backward()
+        detached = fake_loss.detach()
+        return DistillStepOutput(total=detached, l1=detached, giou=detached * 0.0, ver=detached * 0.0)
+
+    monkeypatch.setattr(trainer_module, "run_phase2_finetune_step", _fake_phase2_step)
+
+    trainer.train()
+
+    optimizer = optimizer_holder["optimizer"]
+    assert optimizer.step_count == 2

@@ -287,6 +287,7 @@ class Trainer:
             self._apply_epoch_trainability(model, epoch)
             optimizer.zero_grad(set_to_none=True)
             metrics = self._epoch_metrics_template()
+            processed_steps = 0
 
             if self.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(self.device)
@@ -294,6 +295,7 @@ class Trainer:
             for step, batch in enumerate(dataloader, start=1):
                 if batches_per_epoch > 0 and step > batches_per_epoch:
                     break
+                processed_steps += 1
 
                 losses = run_distillation_step(
                     model=model,
@@ -361,6 +363,14 @@ class Trainer:
                 metrics["l1"] += float(losses.l1.detach().cpu().item())
                 metrics["giou"] += float(losses.giou.detach().cpu().item())
                 metrics["ver"] += float(losses.ver.detach().cpu().item())
+
+            if processed_steps > 0 and processed_steps % grad_accum_steps != 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
 
             denom = batches_per_epoch if batches_per_epoch > 0 else len(dataloader)
             denom = max(denom, 1)

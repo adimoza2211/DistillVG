@@ -49,6 +49,26 @@ def test_box_loss_is_finite() -> None:
     assert torch.isfinite(loss)
 
 
+def test_box_loss_supports_per_sample_reduction() -> None:
+    pred = torch.tensor(
+        [
+            [0.1, 0.1, 0.5, 0.5],
+            [0.2, 0.2, 0.6, 0.6],
+        ],
+        dtype=torch.float32,
+    )
+    gt = torch.tensor(
+        [
+            [0.1, 0.1, 0.4, 0.4],
+            [0.2, 0.2, 0.7, 0.7],
+        ],
+        dtype=torch.float32,
+    )
+    per_sample = box_loss(pred, gt, reduction="none")
+    assert per_sample.shape == (2,)
+    assert torch.all(torch.isfinite(per_sample))
+
+
 def test_grounding_loss_and_verifier_ordinal_score() -> None:
     loss_fn = GroundingLoss(lambda1=0.1, lambda2=1.0, lambda3=5.0)
     student_logits = torch.randn(2, 5, 4)

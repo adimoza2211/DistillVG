@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 
 import torch
 from torchvision.ops import box_iou
@@ -27,9 +28,15 @@ class DistillStepOutput:
 
 def _encode_phrase_to_ids(phrase: str, seq_len: int, vocab_size: int, device: torch.device) -> torch.Tensor:
     token_ids = torch.zeros(seq_len, dtype=torch.long, device=device)
+    if vocab_size <= 1:
+        return token_ids
+
+    token_space = vocab_size - 1
     words = phrase.lower().split()
     for index, word in enumerate(words[:seq_len]):
-        token_ids[index] = abs(hash(word)) % max(vocab_size, 2)
+        digest = hashlib.blake2b(word.encode("utf-8"), digest_size=8).digest()
+        stable_hash = int.from_bytes(digest, byteorder="little", signed=False)
+        token_ids[index] = 1 + (stable_hash % token_space)
     return token_ids
 
 

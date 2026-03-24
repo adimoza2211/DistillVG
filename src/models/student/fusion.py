@@ -1,27 +1,38 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
-def _select_evenly_spaced_tokens(tokens: torch.Tensor, target_tokens: int) -> torch.Tensor:
-    batch_size, source_tokens, hidden_dim = tokens.shape
+def _factorize_target_tokens(target_tokens: int) -> tuple[int, int]:
     if target_tokens <= 0:
         raise ValueError("target_tokens must be > 0")
+
+    best_h = 1
+    best_w = target_tokens
+    best_gap = abs(best_w - best_h)
+    for height in range(1, int(target_tokens**0.5) + 1):
+        if target_tokens % height != 0:
+            continue
+        width = target_tokens // height
+        gap = abs(width - height)
+        if gap < best_gap:
+            best_h, best_w, best_gap = height, width, gap
+    return best_h, best_w
+
+
+def _resize_spatial_tokens(tokens: torch.Tensor, target_tokens: int) -> torch.Tensor:
+    batch_size, source_tokens, hidden_dim = tokens.shape
     if source_tokens == target_tokens:
         return tokens
-    if source_tokens > target_tokens:
-        indices = torch.linspace(
-            0,
-            source_tokens - 1,
-            steps=target_tokens,
-            device=tokens.device,
-        ).round().long()
-        gather_index = indices.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, hidden_dim)
-        return torch.gather(tokens, dim=1, index=gather_index)
 
-    padding = tokens.new_zeros(batch_size, target_tokens - source_tokens, hidden_dim)
-    return torch.cat([tokens, padding], dim=1)
+    source_h, source_w = _factorize_target_tokens(source_tokens)
+
+    target_h, target_w = _factorize_target_tokens(target_tokens)
+    feature_map = tokens.transpose(1, 2).reshape(batch_size, hidden_dim, source_h, source_w)
+    resized = F.adaptive_avg_pool2d(feature_map, output_size=(target_h, target_w))
+    return resized.flatten(2).transpose(1, 2)
 
 
 class FusionTransformer(nn.Module):
@@ -51,5 +62,5 @@ class FusionTransformer(nn.Module):
         fused = self.norm(visual_tokens + text_context)
         fused = fused + self.mlp(fused)
         if fused.shape[1] != self.target_tokens:
-            fused = _select_evenly_spaced_tokens(fused, self.target_tokens)
+            fused = _resize_spatial_tokens(fused, self.target_tokens)
         return fused
