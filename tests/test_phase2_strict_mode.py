@@ -13,7 +13,10 @@ from src.training.trainer import Trainer
 def _build_student() -> StudentModel:
     return StudentModel(
         hidden_dim=32,
+        fusion_layers=2,
+        attention_heads=4,
         vocab_size=128,
+        roi_tokens=32,
         tob_tokens=24,
         proposal_count=20,
         use_yolo26_proposals=False,

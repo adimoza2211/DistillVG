@@ -24,6 +24,11 @@ class Trainer:
         self.device = self._resolve_device()
         set_seed(int(self.cfg.seed), deterministic=False)
 
+    @staticmethod
+    def _parse_gpu_id_count(gpu_ids: str) -> int:
+        ids = [value.strip() for value in gpu_ids.split(",") if value.strip()]
+        return len(ids)
+
     def _resolve_device(self) -> torch.device:
         requested = str(self.cfg.training.device)
         if requested == "auto":
@@ -57,9 +62,12 @@ class Trainer:
         raise ValueError(f"Unsupported AMP dtype: {amp_dtype}")
 
     def _num_gpus_for_batch_math(self) -> int:
-        configured = int(getattr(self.cfg.training, "num_gpus", 0))
-        if configured > 0:
-            return configured
+        available_gpu_ids = str(getattr(self.cfg.training, "available_gpu_ids", "")).strip()
+        if available_gpu_ids:
+            inferred = self._parse_gpu_id_count(available_gpu_ids)
+            if inferred > 0:
+                return inferred
+
         if self.device.type == "cuda":
             return max(torch.cuda.device_count(), 1)
         return 1
@@ -138,7 +146,10 @@ class Trainer:
         training_cfg = self.cfg.training
         model = StudentModel(
             hidden_dim=int(training_cfg.hidden_dim),
+            fusion_layers=int(self.cfg.model.fusion_layers),
+            attention_heads=int(self.cfg.model.attention_heads),
             vocab_size=int(training_cfg.text_vocab_size),
+            roi_tokens=int(self.cfg.model.roi_tokens),
             tob_tokens=int(self.cfg.model.tob_tokens),
             proposal_count=int(self.cfg.model.proposal_count),
             use_yolo26_proposals=bool(self.cfg.model.proposal_generator.use_yolo26),

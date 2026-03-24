@@ -1,6 +1,0 @@
-# Static loss weights read by `Trainer._loss_weights()`.
-# These are the base coefficients used by the combined grounding loss.
-# Dynamic schedules (DWBD/STAL/ProgLoss) are applied on top.
-lambda_l1: 5.0
-lambda_giou: 2.0
-lambda_ver: 1.0

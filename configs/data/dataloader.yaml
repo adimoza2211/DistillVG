@@ -1,7 +1,0 @@
-# DataLoader worker/runtime settings consumed by `Trainer._build_dataloader()`.
-# These control CPU-side throughput and host-to-device input pipeline behavior.
-# Tune based on storage speed and CPU worker availability.
-num_workers: 8
-pin_memory: true
-persistent_workers: true
-prefetch_factor: 2

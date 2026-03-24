@@ -1,88 +1,179 @@
 defaults:
-  # Hydra composition for train entrypoint.
-  # Each file below is merged into one runtime config object.
-  # `scripts/train.py` consumes the merged object via `Trainer`.
-  - data/dataloader
-  - model/student
-  - train/efficiency
-  - train/losses
   - _self_
+
+# Single authoritative training config for DistillVG.
+# All runtime controls live in this one file under clear sections.
 
 experiment: student_full
 seed: 42
 
+# Top-level combined loss coefficients used in the training loop.
 lambda1: 0.1
 lambda2: 1.0
-lambda3: 5.0
+lambda3: 8.0
 
 training:
-  # --- Core loop controls (maps to common train.sh flags) ---
-  # `batch_size_per_gpu` + `grad_accum_steps` + `num_gpus` define effective batch.
-  # `batches_per_epoch` limits batches consumed each epoch (0 = full dataloader pass).
+  # --------------------------
+  # Runtime execution controls
+  # --------------------------
+
+  # Number of epochs and optional batch cap per epoch (0 = full dataloader pass).
   epochs: 90
   batches_per_epoch: 0
+
+  # Micro-batch size loaded on each visible GPU.
   batch_size_per_gpu: 4
-  num_gpus: 1
-  gpu_ids: ""
+
+  # Preferred way to control visible GPUs.
+  # Example: "0,1" means GPU 0 and 1 are visible.
+  # Leave empty to use all visible devices.
+  available_gpu_ids: ""
+
+  # Optional cap on training records for fast debugging (0 = all records).
   max_train_records: 0
 
-  # --- Model/input sizing controls ---
-  # Image preprocessing keeps aspect ratio: longer edge -> `resize_long_edge`,
-  # then pads shorter edge with zeros to `padded_square_size`.
-  hidden_dim: 256
+  # -----------------
+  # Model/input sizes
+  # -----------------
+
+  # Shared hidden width for student projections and fusion.
+  hidden_dim: 512
+
+  # Resize long edge and then pad to square size.
   resize_long_edge: 640
   padded_square_size: 640
+
+  # Text tokenization limits for the lightweight text encoder.
   max_query_length: 40
   text_vocab_size: 1024
 
-  # --- Optimizer base settings ---
-  # `lr` corresponds to base learning rate (like --lr in CLI scripts).
-  # Weight decay is applied through selected optimizer param groups.
-  lr: 1.0e-4
+  # -----------------
+  # Optimizer defaults
+  # -----------------
+
+  # Base learning rate; component-specific scaling is done in Trainer.
+  lr: 2.0e-4
   weight_decay: 0.05
 
-  # --- Device policy ---
-  # `auto` picks cuda if available, else cpu.
-  # `auto_least_used`/`auto_max_free` picks visible GPU with most free VRAM.
-  # You can force a device explicitly, e.g. `cuda:1`.
+  # --------------------------
+  # Device placement policy
+  # --------------------------
+
+  # auto -> cuda if available else cpu
+  # auto_least_used/auto_max_free -> pick best cuda device by free memory
+  # explicit -> e.g. cuda:1
   device: auto
 
+data:
+  # DataLoader worker/runtime settings.
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+
+model:
+  # Student architecture capacity controls.
+  fusion_layers: 6
+  attention_heads: 8
+
+  # Visual token budgets.
+  roi_tokens: 300
+  tob_tokens: 200
+
+  # Proposal budget consumed by verifier ranking and final selection.
+  proposal_count: 300
+
+  proposal_generator:
+    # If true, YOLO26 proposals are used instead of learned proposal boxes.
+    use_yolo26: true
+    yolo26_model_cfg: ""
+    yolo26_weights_path: ""
+    yolo26_conf_threshold: 0.001
+    yolo26_iou_threshold: 0.85
+
 verifier:
-  # Online verifier runtime settings used during phase1 distillation.
-  # This block controls verifier backend/model loading and how stage1/stage2
-  # proposal scoring queries are built and executed per training step.
+  # Online verifier runtime config (phase1 only).
   backend: internvl
   model_id: OpenGVLab/InternVL3_5-8B
+
   image_root: data/datasets/other/images/mscoco/images/train2014
   source_image_roots:
-    # Per-dataset image roots to resolve annotation filenames correctly.
-    # COCO-family datasets point to COCO train2014 root.
-    # ReferIt points to its own numeric-filename image directory.
     referit: data/datasets/referit/images
     unc: data/datasets/other/images/mscoco/images/train2014
     unc+: data/datasets/other/images/mscoco/images/train2014
     gref: data/datasets/other/images/mscoco/images/train2014
     gref_umd: data/datasets/other/images/mscoco/images/train2014
   source_image_styles:
-    # Filename interpretation per dataset source.
-    # `coco` converts numeric ids to `COCO_train2014_XXXXXXXXXXXX.jpg`.
-    # `referit` keeps direct numeric jpg naming (e.g., `10000.jpg`).
     referit: referit
     unc: coco
     unc+: coco
     gref: coco
     gref_umd: coco
+
   mock_hidden_dim: 64
   crop_size: 64
   top_k_proposals: 16
   stage2_top_k: 5
   use_augmented_queries: true
   query_selection: first
-  # FlashAttention preference for InternVL load path.
-  # `auto` enables flash attention only when the package is installed.
-  # Set `true`/`false` to force behavior.
-  use_flash_attn: auto
-  # Glob for *_aug.pth files that provide grounding records/phrases.
-  # These records are loaded into the dataloader at startup.
-  # Empty matches will fail phase1 training by design.
+
+  # FlashAttention behavior:
+  # true  -> require flash_attn; raise error if unavailable
+  # false -> disable FlashAttention
+  # auto  -> use if installed, otherwise fallback with warning
+  use_flash_attn: true
+
+  # Glob for pre-generated *_aug.pth phrase/box records.
   augmented_phrase_glob: data/annotations/*/*_aug.pth
+
+train:
+  # -----------------
+  # Runtime efficiency
+  # -----------------
+
+  amp: true
+  amp_dtype: bf16
+  grad_accum_steps: 16
+  grad_clip_norm: 0.1
+
+  # ------------------
+  # Training mode/opt
+  # ------------------
+
+  mode: phase1
+  optimizer: musgd
+
+  # Epoch-level LR decay scheduler settings.
+  lr_decay_epoch: 40
+  lr_decay_gamma: 0.1
+
+  # Freeze text encoder for first N phase1 epochs.
+  freeze_text_encoder_epochs: 10
+
+  musgd:
+    momentum: 0.95
+    muon_beta: 0.95
+    eps: 1.0e-8
+
+  dwbd:
+    enabled: true
+    alpha_max: 0.7
+    alpha_min: 0.1
+    gamma: 2.0
+
+  stal:
+    enabled: true
+    area_threshold: 0.05
+    max_boost: 1.5
+
+  progloss:
+    enabled: true
+    box_start_scale: 0.9
+    box_end_scale: 1.1
+    verifier_start_scale: 1.1
+    verifier_end_scale: 0.9
+    power: 1.0
+
+  # Static loss weights used by Trainer._loss_weights().
+  lambda_l1: 5.0
+  lambda_giou: 2.0
+  lambda_ver: 1.0

@@ -14,16 +14,10 @@ from src.training.trainer import Trainer
 
 def _configure_visible_gpus(cfg: DictConfig) -> None:
     training_cfg = cfg.training
-    gpu_ids = str(getattr(training_cfg, "gpu_ids", "")).strip()
-    num_gpus = int(getattr(training_cfg, "num_gpus", 0))
-
-    if gpu_ids:
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
+    available_gpu_ids = str(getattr(training_cfg, "available_gpu_ids", "")).strip()
+    if not available_gpu_ids:
         return
-
-    if num_gpus > 0:
-        requested_ids = ",".join(str(index) for index in range(num_gpus))
-        os.environ["CUDA_VISIBLE_DEVICES"] = requested_ids
+    os.environ["CUDA_VISIBLE_DEVICES"] = available_gpu_ids
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train")

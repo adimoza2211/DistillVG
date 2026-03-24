@@ -48,6 +48,8 @@ The target system is online distillation. Do not introduce persistent verifier c
 - Student backbone: YOLO26-small style visual encoder that produces proposal-aligned tokens for the current image.
 - Text encoder: MobileCLIP-S1 style encoder for the grounding expression.
 - Student fusion: lightweight token-mixing block that combines visual tokens with text context and feeds both box regression and plausibility scoring.
+- Student fusion depth and attention heads are configuration-driven (`model.fusion_layers`, `model.attention_heads`) and must be wired through runtime construction.
+- Student visual token budgets are configuration-driven (`model.roi_tokens`, `model.tob_tokens`) and must be enforced in runtime token flow.
 - Student heads: one bbox regression head plus one plausibility/verifier head in the student model.
 - Verifier: InternVL 3.5-8B, frozen, 4-bit.
 - Training loop: online crop generation, online verifier scoring, immediate loss computation.

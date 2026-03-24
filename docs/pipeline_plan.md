@@ -230,13 +230,13 @@ def on_epoch_start(self, epoch: int):
 **Class:** `FusionTransformer(nn.Module)`
 
 **Architecture:**
-- 4 transformer layers, each with:
+- Configurable transformer stack controlled by `model.fusion_layers` and `model.attention_heads`, each layer with:
   - Cross-attention: visual tokens attend to text tokens (Q=visual, K=V=text)
   - Self-attention on visual tokens
-  - FFN with hidden_dim = 4 × 384 = 1536
-  - Pre-LN normalization
-- d_model = 384, n_heads = 6, head_dim = 64
-- ~7M parameters, **fully trainable**.
+  - FFN with expansion ratio 4x hidden dim
+  - Residual + LayerNorm after each sub-block
+- d_model = `training.hidden_dim`, n_heads = `model.attention_heads`
+- Parameter count scales directly with depth and width, **fully trainable**.
 
 **Token Blurring (ToB) — applied after Layer 2:**
 - Implements similarity-weighted token merging (NOT dropping) from Token Merging (ToMe).
@@ -259,7 +259,7 @@ def on_epoch_start(self, epoch: int):
 ```python
 def forward(
     self,
-    roi_tokens: torch.Tensor,      # [B, 200, 384]
+  roi_tokens: torch.Tensor,      # [B, model.roi_tokens, d_model]
     text_tokens: torch.Tensor,     # [B, 77, 384]
     text_pooled: torch.Tensor,     # [B, 384]
 ) -> FusionOutput:

@@ -45,7 +45,10 @@ class StudentModel(nn.Module):
     def __init__(
         self,
         hidden_dim: int,
+        fusion_layers: int,
+        attention_heads: int,
         vocab_size: int,
+        roi_tokens: int,
         tob_tokens: int,
         proposal_count: int,
         use_yolo26_proposals: bool,
@@ -57,7 +60,13 @@ class StudentModel(nn.Module):
         super().__init__()
         self.backbone = StudentBackbone(hidden_dim=hidden_dim)
         self.text_encoder = StudentTextEncoder(vocab_size=vocab_size, hidden_dim=hidden_dim)
-        self.fusion = FusionTransformer(hidden_dim=hidden_dim, target_tokens=tob_tokens)
+        self.fusion = FusionTransformer(
+            hidden_dim=hidden_dim,
+            target_tokens=tob_tokens,
+            num_layers=fusion_layers,
+            attention_heads=attention_heads,
+        )
+        self.roi_tokens = int(roi_tokens)
         self.proposal_count = int(proposal_count)
         self.use_yolo26_proposals = bool(use_yolo26_proposals)
         self.bbox_head = nn.Sequential(
@@ -83,6 +92,7 @@ class StudentModel(nn.Module):
 
     def forward(self, images: torch.Tensor, token_ids: torch.Tensor, attention_mask: torch.Tensor) -> dict[str, torch.Tensor]:
         visual_tokens = self.backbone(images)
+        visual_tokens = _resize_spatial_tokens(visual_tokens, self.roi_tokens)
         text_tokens = self.text_encoder(token_ids, attention_mask)
         fused_tokens = self.fusion(visual_tokens, text_tokens, attention_mask)
 

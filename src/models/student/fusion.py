@@ -36,13 +36,56 @@ def _resize_spatial_tokens(tokens: torch.Tensor, target_tokens: int) -> torch.Te
 
 
 class FusionTransformer(nn.Module):
-    def __init__(self, hidden_dim: int, target_tokens: int) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        target_tokens: int,
+        num_layers: int,
+        attention_heads: int,
+    ) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
+        if num_layers <= 0:
+            raise ValueError("num_layers must be > 0")
+        if attention_heads <= 0:
+            raise ValueError("attention_heads must be > 0")
+        if hidden_dim % attention_heads != 0:
+            raise ValueError("hidden_dim must be divisible by attention_heads")
+
+        self.input_norm = nn.LayerNorm(hidden_dim)
+        self.cross_attention = nn.ModuleList(
+            [
+                nn.MultiheadAttention(
+                    embed_dim=hidden_dim,
+                    num_heads=attention_heads,
+                    dropout=0.0,
+                    batch_first=True,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.self_attention = nn.ModuleList(
+            [
+                nn.MultiheadAttention(
+                    embed_dim=hidden_dim,
+                    num_heads=attention_heads,
+                    dropout=0.0,
+                    batch_first=True,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.norm_after_cross = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+        self.norm_after_self = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+        self.norm_after_mlp = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+        self.mlp = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim * 4),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim * 4, hidden_dim),
+                )
+                for _ in range(num_layers)
+            ]
         )
         self.target_tokens = target_tokens
 
@@ -53,14 +96,47 @@ class FusionTransformer(nn.Module):
         text_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if text_mask is None:
-            text_context = text_tokens.mean(dim=1, keepdim=True)
+            text_mask = torch.ones(
+                text_tokens.shape[0],
+                text_tokens.shape[1],
+                dtype=torch.bool,
+                device=text_tokens.device,
+            )
         else:
-            weights = text_mask.unsqueeze(-1).to(text_tokens.dtype)
-            denominator = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
-            text_context = (text_tokens * weights).sum(dim=1, keepdim=True) / denominator
+            text_mask = text_mask.to(dtype=torch.bool)
 
-        fused = self.norm(visual_tokens + text_context)
-        fused = fused + self.mlp(fused)
+        empty_rows = ~text_mask.any(dim=1)
+        if empty_rows.any():
+            text_mask = text_mask.clone()
+            text_mask[empty_rows, 0] = True
+
+        weights = text_mask.unsqueeze(-1).to(text_tokens.dtype)
+        denominator = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+        text_context = (text_tokens * weights).sum(dim=1, keepdim=True) / denominator
+
+        fused = self.input_norm(visual_tokens + text_context)
+        key_padding_mask = ~text_mask
+        for layer_idx in range(len(self.cross_attention)):
+            cross_output, _ = self.cross_attention[layer_idx](
+                query=fused,
+                key=text_tokens,
+                value=text_tokens,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )
+            fused = self.norm_after_cross[layer_idx](fused + cross_output)
+
+            self_output, _ = self.self_attention[layer_idx](
+                query=fused,
+                key=fused,
+                value=fused,
+                need_weights=False,
+            )
+            fused = self.norm_after_self[layer_idx](fused + self_output)
+
+            mlp_output = self.mlp[layer_idx](fused)
+            fused = self.norm_after_mlp[layer_idx](fused + mlp_output)
+
         if fused.shape[1] != self.target_tokens:
             fused = _resize_spatial_tokens(fused, self.target_tokens)
         return fused

@@ -18,6 +18,8 @@ What is already established:
 - The distillation trainer lives in [src/training/trainer.py](src/training/trainer.py).
 - The active Phase-1/Phase-2 loss stack is now under [src/losses/](src/losses/) with combined loss composition in [src/losses/combined.py](src/losses/combined.py).
 - The student implementation is split across [src/models/student/model.py](src/models/student/model.py), [src/models/student/backbone.py](src/models/student/backbone.py), [src/models/student/text_encoder.py](src/models/student/text_encoder.py), [src/models/student/fusion.py](src/models/student/fusion.py), and [src/models/student/verifier.py](src/models/student/verifier.py).
+- Fusion depth and attention head count are now consumed from Hydra config (`model.fusion_layers`, `model.attention_heads`) and directly control student capacity.
+- Pre-fusion visual token budget is now consumed from Hydra config (`model.roi_tokens`) and applied in the student forward path.
 - Phase 1 has started: the trainer now builds a frozen online verifier module and computes verifier supervision inside each training step.
 - The distillation step now converts student proposal boxes into online crops and scores top-K proposals with a frozen verifier path.
 - Verifier backend is now configured InternVL-first in Hydra, with explicit 4-bit loading scaffolding.

@@ -24,23 +24,6 @@ def _normalize_crop_for_processor(crop: torch.Tensor) -> torch.Tensor:
     return crop.clamp(0.0, 1.0)
 
 
-def _collect_single_token_ids(tokenizer: Any, candidates: list[str]) -> list[int]:
-    token_ids: list[int] = []
-    for candidate in candidates:
-        encoded = tokenizer.encode(candidate, add_special_tokens=False)
-        if len(encoded) == 1:
-            token_ids.append(int(encoded[0]))
-    unique = sorted(set(token_ids))
-    if not unique:
-        raise RuntimeError(f"None of the candidate labels are single-token for this tokenizer: {candidates}")
-    return unique
-
-
-def _group_score(next_token_logits: torch.Tensor, token_ids: list[int]) -> torch.Tensor:
-    token_logits = next_token_logits[:, token_ids]
-    return torch.logsumexp(token_logits, dim=-1)
-
-
 def _internvl_binary_question(query: str) -> str:
     return (
         "<image>\n"
@@ -88,14 +71,18 @@ def _flash_attn_available() -> bool:
 def _resolve_use_flash_attn(preference: str | bool) -> bool:
     if isinstance(preference, bool):
         requested = preference
+        is_explicit_true = preference
     else:
         normalized = preference.strip().lower()
         if normalized == "auto":
             requested = True
+            is_explicit_true = False
         elif normalized in {"true", "1", "yes", "y", "on"}:
             requested = True
+            is_explicit_true = True
         elif normalized in {"false", "0", "no", "n", "off"}:
             requested = False
+            is_explicit_true = False
         else:
             raise ValueError(f"Unsupported verifier.use_flash_attn value: {preference}")
 
@@ -103,6 +90,11 @@ def _resolve_use_flash_attn(preference: str | bool) -> bool:
         return False
     if _flash_attn_available():
         return True
+    if is_explicit_true:
+        raise RuntimeError(
+            "verifier.use_flash_attn=true but flash_attn is not installed. "
+            "Install flash_attn or set verifier.use_flash_attn=auto/false."
+        )
     warnings.warn("flash_attn is not installed; falling back to non-FlashAttention verifier inference.")
     return False
 

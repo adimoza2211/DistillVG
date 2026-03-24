@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from pathlib import Path
 
 import torch
 
@@ -21,13 +20,7 @@ class YOLO26ProposalConfig:
 
 
 def _default_yolo26_cfg_path() -> str:
-    import ultralytics
-
-    root = Path(ultralytics.__file__).resolve().parent
-    candidate = root / "cfg" / "models" / "26" / "yolo26.yaml"
-    if not candidate.exists():
-        raise FileNotFoundError(f"Unable to find yolo26.yaml in ultralytics package: {candidate}")
-    return str(candidate)
+    return "yolo26s.yaml"
 
 
 def _normalize_xyxy(boxes: torch.Tensor, image_width: int, image_height: int) -> torch.Tensor:
