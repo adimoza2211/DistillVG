@@ -13,9 +13,15 @@ def _normalize_xyxy(boxes: torch.Tensor) -> torch.Tensor:
     return torch.stack([x1, y1, x2, y2], dim=-1)
 
 
-def box_loss(pred_boxes: torch.Tensor, gt_boxes: torch.Tensor) -> torch.Tensor:
-    pred_xyxy = _normalize_xyxy(pred_boxes.sigmoid())
+def box_loss(pred_boxes: torch.Tensor, gt_boxes: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+    pred_xyxy = _normalize_xyxy(pred_boxes)
     gt_xyxy = _normalize_xyxy(gt_boxes)
-    l1 = F.l1_loss(pred_xyxy, gt_xyxy, reduction="mean")
-    giou = 1.0 - generalized_box_iou(pred_xyxy, gt_xyxy).diagonal().mean()
-    return l1 + giou
+    l1 = F.l1_loss(pred_xyxy, gt_xyxy, reduction="none").mean(dim=-1)
+    giou = 1.0 - generalized_box_iou(pred_xyxy, gt_xyxy).diagonal()
+    loss = l1 + giou
+
+    if reduction == "none":
+        return loss
+    if reduction == "mean":
+        return loss.mean()
+    raise ValueError(f"Unsupported reduction: {reduction}")

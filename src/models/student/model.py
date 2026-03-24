@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from src.models.student.backbone import StudentBackbone
@@ -9,6 +8,26 @@ from src.models.student.fusion import FusionTransformer
 from src.models.student.proposals import YOLO26ProposalGenerator
 from src.models.student.text_encoder import StudentTextEncoder
 from src.models.student.verifier import VerifierHead
+
+
+def _select_evenly_spaced_tokens(tokens: torch.Tensor, target_tokens: int) -> torch.Tensor:
+    batch_size, source_tokens, hidden_dim = tokens.shape
+    if target_tokens <= 0:
+        raise ValueError("target_tokens must be > 0")
+    if source_tokens == target_tokens:
+        return tokens
+    if source_tokens > target_tokens:
+        indices = torch.linspace(
+            0,
+            source_tokens - 1,
+            steps=target_tokens,
+            device=tokens.device,
+        ).round().long()
+        gather_index = indices.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, hidden_dim)
+        return torch.gather(tokens, dim=1, index=gather_index)
+
+    padding = tokens.new_zeros(batch_size, target_tokens - source_tokens, hidden_dim)
+    return torch.cat([tokens, padding], dim=1)
 
 
 class StudentModel(nn.Module):
@@ -54,15 +73,13 @@ class StudentModel(nn.Module):
     def forward(self, images: torch.Tensor, token_ids: torch.Tensor, attention_mask: torch.Tensor) -> dict[str, torch.Tensor]:
         visual_tokens = self.backbone(images)
         text_tokens = self.text_encoder(token_ids, attention_mask)
-        fused_tokens = self.fusion(visual_tokens, text_tokens)
+        fused_tokens = self.fusion(visual_tokens, text_tokens, attention_mask)
 
         pooled_visual = fused_tokens.mean(dim=1)
-        pooled_text = text_tokens.mean(dim=1)
+        text_weights = attention_mask.unsqueeze(-1).to(text_tokens.dtype)
+        pooled_text = (text_tokens * text_weights).sum(dim=1) / text_weights.sum(dim=1).clamp_min(1.0)
 
-        pooled_proposal_features = F.adaptive_avg_pool1d(
-            fused_tokens.transpose(1, 2),
-            self.proposal_count,
-        ).transpose(1, 2)
+        pooled_proposal_features = _select_evenly_spaced_tokens(fused_tokens, self.proposal_count)
 
         if self.yolo26 is None:
             proposal_boxes = self.proposal_bbox_head(pooled_proposal_features)
@@ -82,7 +99,7 @@ class StudentModel(nn.Module):
 
         verifier_logit = torch.gather(proposal_ranking_scores, dim=1, index=top_indices).squeeze(1)
 
-        bbox = bbox + self.bbox_head(pooled_visual)
+        bbox = (bbox + self.bbox_head(pooled_visual)).clamp(0.0, 1.0)
 
         return {
             "bbox": bbox,

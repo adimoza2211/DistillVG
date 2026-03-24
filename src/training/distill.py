@@ -241,18 +241,21 @@ def run_distillation_step(
             enabled=progloss_enabled,
         )
 
+        per_sample_box = box_loss(outputs["bbox"], target_box, reduction="none")
+        weighted_box = (per_sample_box * stal_weight).sum() / stal_weight.sum().clamp_min(1.0)
+
         total = (
             combined.dwbd
             + lambda1 * combined.cst
             + lambda2 * verifier_scale * combined.ver_kl
-            + lambda3 * box_scale * stal_weight * combined.box
+            + lambda3 * box_scale * weighted_box
         )
         scaled_total = total / grad_accum_steps
 
     scaler.scale(scaled_total).backward()
     return DistillStepOutput(
         total=total.detach(),
-        l1=combined.box.detach(),
+        l1=weighted_box.detach(),
         giou=torch.zeros_like(combined.box.detach()),
         ver=combined.ver_kl.detach(),
     )
@@ -289,7 +292,7 @@ def run_phase2_finetune_step(
 
     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
         outputs = model(images=images, token_ids=token_ids, attention_mask=attention_mask)
-        l_box = box_loss(outputs["bbox"], target_box)
+        per_sample_box = box_loss(outputs["bbox"], target_box, reduction="none")
 
         l_cst = torch.zeros((), device=images.device, dtype=outputs["bbox"].dtype)
         maybe_augmented_inputs = _build_augmented_inputs(
@@ -319,7 +322,9 @@ def run_phase2_finetune_step(
             enabled=progloss_enabled,
         )
 
-        total = lambda3 * box_scale * stal_weight * l_box + lambda1 * l_cst
+        l_box = (per_sample_box * stal_weight).sum() / stal_weight.sum().clamp_min(1.0)
+
+        total = lambda3 * box_scale * l_box + lambda1 * l_cst
         scaled_total = total / grad_accum_steps
 
     scaler.scale(scaled_total).backward()

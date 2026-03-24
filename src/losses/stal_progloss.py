@@ -11,7 +11,7 @@ def compute_stal_weight(
     enabled: bool,
 ) -> torch.Tensor:
     if not enabled:
-        return torch.ones((), device=gt_boxes_xyxy.device, dtype=gt_boxes_xyxy.dtype)
+        return torch.ones(gt_boxes_xyxy.shape[0], device=gt_boxes_xyxy.device, dtype=gt_boxes_xyxy.dtype)
 
     x1 = torch.minimum(gt_boxes_xyxy[..., 0], gt_boxes_xyxy[..., 2])
     y1 = torch.minimum(gt_boxes_xyxy[..., 1], gt_boxes_xyxy[..., 3])
@@ -22,7 +22,7 @@ def compute_stal_weight(
     threshold = max(float(area_threshold), 1e-6)
     ratio = (threshold / areas).clamp(min=1.0)
     per_sample_weight = ratio.sqrt().clamp(max=max(float(max_boost), 1.0))
-    return per_sample_weight.mean()
+    return per_sample_weight
 
 
 def compute_progloss_scale(

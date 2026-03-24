@@ -93,7 +93,9 @@ def test_stal_weight_boosts_smaller_targets() -> None:
         max_boost=2.0,
         enabled=True,
     )
-    assert float(weight.item()) > 1.0
+    assert weight.shape == (2,)
+    assert float(weight[0].item()) > float(weight[1].item())
+    assert float(weight[0].item()) > 1.0
 
 
 def test_progloss_scale_progresses_linearly() -> None:

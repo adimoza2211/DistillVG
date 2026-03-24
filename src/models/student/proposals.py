@@ -94,7 +94,7 @@ class YOLO26ProposalGenerator:
             xyxy = _normalize_xyxy(xyxy, image_width=image_width, image_height=image_height)
 
             if xyxy.shape[0] < self.max_proposals:
-                pad = torch.zeros(self.max_proposals - xyxy.shape[0], 4, dtype=xyxy.dtype, device=xyxy.device)
+                pad = xyxy[-1:].expand(self.max_proposals - xyxy.shape[0], -1)
                 xyxy = torch.cat([xyxy, pad], dim=0)
 
             packed_boxes.append(xyxy)
