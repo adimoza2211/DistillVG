@@ -28,7 +28,41 @@ class Trainer:
         requested = str(self.cfg.training.device)
         if requested == "auto":
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if requested in {"auto_least_used", "auto_max_free"}:
+            return self._select_max_free_cuda_device()
         return torch.device(requested)
+
+    @staticmethod
+    def _select_max_free_cuda_device() -> torch.device:
+        if not torch.cuda.is_available():
+            return torch.device("cpu")
+
+        best_index = 0
+        best_free = -1
+        for index in range(torch.cuda.device_count()):
+            with torch.cuda.device(index):
+                free_bytes, _ = torch.cuda.mem_get_info()
+            if int(free_bytes) > best_free:
+                best_free = int(free_bytes)
+                best_index = int(index)
+        return torch.device(f"cuda:{best_index}")
+
+    @staticmethod
+    def _resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
+        normalized = amp_dtype.strip().lower()
+        if normalized in {"bf16", "bfloat16"}:
+            return torch.bfloat16
+        if normalized in {"fp16", "float16", "half"}:
+            return torch.float16
+        raise ValueError(f"Unsupported AMP dtype: {amp_dtype}")
+
+    def _num_gpus_for_batch_math(self) -> int:
+        configured = int(getattr(self.cfg.training, "num_gpus", 0))
+        if configured > 0:
+            return configured
+        if self.device.type == "cuda":
+            return max(torch.cuda.device_count(), 1)
+        return 1
 
     def _loss_weights(self) -> dict[str, float]:
         return {
@@ -60,6 +94,7 @@ class Trainer:
             )
 
         max_records = int(getattr(training_cfg, "max_records", 0))
+        max_records = int(getattr(training_cfg, "max_train_records", max_records))
         if max_records > 0:
             records = records[:max_records]
 
@@ -68,9 +103,18 @@ class Trainer:
         dataset = AugmentedGroundingDataset(
             records=records,
             image_root=str(self.cfg.verifier.image_root),
-            image_size=int(training_cfg.image_size),
-            seq_len=int(training_cfg.seq_len),
-            vocab_size=int(training_cfg.vocab_size),
+            resize_long_edge=int(training_cfg.resize_long_edge),
+            padded_square_size=int(training_cfg.padded_square_size),
+            max_query_length=int(training_cfg.max_query_length),
+            text_vocab_size=int(training_cfg.text_vocab_size),
+            source_image_roots={
+                str(key): str(value)
+                for key, value in getattr(self.cfg.verifier, "source_image_roots", {}).items()
+            },
+            source_image_styles={
+                str(key): str(value)
+                for key, value in getattr(self.cfg.verifier, "source_image_styles", {}).items()
+            },
         )
         sample_weights = self._compute_sampling_weights(records)
         sampler = WeightedRandomSampler(
@@ -80,7 +124,7 @@ class Trainer:
         )
         return DataLoader(
             dataset,
-            batch_size=int(training_cfg.micro_batch_size),
+            batch_size=int(training_cfg.batch_size_per_gpu),
             shuffle=False,
             sampler=sampler,
             num_workers=int(self.cfg.data.num_workers),
@@ -94,7 +138,7 @@ class Trainer:
         training_cfg = self.cfg.training
         model = StudentModel(
             hidden_dim=int(training_cfg.hidden_dim),
-            vocab_size=int(training_cfg.vocab_size),
+            vocab_size=int(training_cfg.text_vocab_size),
             tob_tokens=int(self.cfg.model.tob_tokens),
             proposal_count=int(self.cfg.model.proposal_count),
             use_yolo26_proposals=bool(self.cfg.model.proposal_generator.use_yolo26),
@@ -159,6 +203,7 @@ class Trainer:
 
     def _apply_epoch_trainability(self, model: StudentModel, epoch_index: int) -> None:
         mode = self._train_mode()
+        freeze_text_epochs = int(getattr(self.cfg.train, "freeze_text_encoder_epochs", 5))
         if mode == "phase2_strict":
             model.backbone.train()
             model.text_encoder.train()
@@ -174,7 +219,7 @@ class Trainer:
         for parameter in model.backbone.parameters():
             parameter.requires_grad = False
 
-        if epoch_index < 5:
+        if epoch_index < freeze_text_epochs:
             model.text_encoder.eval()
             for parameter in model.text_encoder.parameters():
                 parameter.requires_grad = False
@@ -205,18 +250,31 @@ class Trainer:
         optimizer = self._build_optimizer(model)
 
         use_amp = bool(self.cfg.train.amp) and self.device.type == "cuda"
+        amp_dtype = self._resolve_amp_dtype(str(getattr(self.cfg.train, "amp_dtype", "bf16")))
         grad_accum_steps = int(self.cfg.train.grad_accum_steps)
         grad_clip_norm = float(self.cfg.train.grad_clip_norm)
-        scaler = torch.amp.GradScaler(device=self.device.type, enabled=use_amp)
+        use_grad_scaler = use_amp and amp_dtype == torch.float16
+        scaler = torch.amp.GradScaler(device=self.device.type, enabled=use_grad_scaler)
         loss_weights = self._loss_weights()
+        batches_per_epoch = int(getattr(self.cfg.training, "batches_per_epoch", 0))
 
-        effective_batch_size = int(self.cfg.training.micro_batch_size) * grad_accum_steps
+        lr_decay_epoch = int(getattr(self.cfg.train, "lr_decay_epoch", 0))
+        lr_decay_gamma = float(getattr(self.cfg.train, "lr_decay_gamma", 0.1))
+        scheduler: torch.optim.lr_scheduler.StepLR | None = None
+        if lr_decay_epoch > 0:
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=lr_decay_epoch, gamma=lr_decay_gamma)
+
+        num_gpus = self._num_gpus_for_batch_math()
+        effective_batch_size = int(self.cfg.training.batch_size_per_gpu) * grad_accum_steps * num_gpus
         self.logger.info(
-            "Starting train | experiment=%s | device=%s | amp=%s | grad_accum=%d | effective_batch=%d | synthetic_scaffold=%s",
+            "Starting train | experiment=%s | device=%s | amp=%s | amp_dtype=%s | per_gpu_batch=%d | grad_accum=%d | num_gpus=%d | effective_batch=%d | synthetic_scaffold=%s",
             self.cfg.experiment,
             self.device,
             use_amp,
+            amp_dtype,
+            int(self.cfg.training.batch_size_per_gpu),
             grad_accum_steps,
+            num_gpus,
             effective_batch_size,
             False,
         )
@@ -234,6 +292,9 @@ class Trainer:
                 torch.cuda.reset_peak_memory_stats(self.device)
 
             for step, batch in enumerate(dataloader, start=1):
+                if batches_per_epoch > 0 and step > batches_per_epoch:
+                    break
+
                 losses = run_distillation_step(
                     model=model,
                     online_verifier=online_verifier,  # type: ignore[arg-type]
@@ -241,6 +302,7 @@ class Trainer:
                     scaler=scaler,
                     device=self.device,
                     use_amp=use_amp,
+                    amp_dtype=amp_dtype,
                     grad_accum_steps=grad_accum_steps,
                     loss_weights=loss_weights,
                     verifier_crop_size=int(self.cfg.verifier.crop_size),
@@ -271,10 +333,11 @@ class Trainer:
                     scaler=scaler,
                     device=self.device,
                     use_amp=use_amp,
+                    amp_dtype=amp_dtype,
                     grad_accum_steps=grad_accum_steps,
                     lambda1=float(self.cfg.lambda1),
                     lambda3=float(self.cfg.lambda3),
-                    vocab_size=int(self.cfg.training.vocab_size),
+                    vocab_size=int(self.cfg.training.text_vocab_size),
                     epoch_index=epoch,
                     total_epochs=int(self.cfg.training.epochs),
                     stal_enabled=bool(self.cfg.train.stal.enabled),
@@ -299,20 +362,28 @@ class Trainer:
                 metrics["giou"] += float(losses.giou.detach().cpu().item())
                 metrics["ver"] += float(losses.ver.detach().cpu().item())
 
-            denom = max(len(dataloader), 1)
+            denom = batches_per_epoch if batches_per_epoch > 0 else len(dataloader)
+            denom = max(denom, 1)
             avg_loss = metrics["total"] / denom
             peak_gpu_memory = 0.0
             if self.device.type == "cuda":
                 peak_gpu_memory = float(torch.cuda.max_memory_allocated(self.device) / (1024 ** 2))
 
+            if scheduler is not None:
+                scheduler.step()
+
+            current_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+            max_lr = max(current_lrs) if current_lrs else 0.0
+
             self.logger.info(
-                "Epoch %d | avg_loss=%.6f | l1=%.6f | giou=%.6f | ver=%.6f | opt_steps=%d | peak_gpu_mem_mb=%.2f | precision=%s",
+                "Epoch %d | avg_loss=%.6f | l1=%.6f | giou=%.6f | ver=%.6f | opt_steps=%d | lr=%.6e | peak_gpu_mem_mb=%.2f | precision=%s",
                 epoch + 1,
                 avg_loss,
                 metrics["l1"] / denom,
                 metrics["giou"] / denom,
                 metrics["ver"] / denom,
                 global_step,
+                max_lr,
                 peak_gpu_memory,
                 "amp" if use_amp else "fp32",
             )

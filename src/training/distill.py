@@ -83,6 +83,7 @@ def run_distillation_step(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     use_amp: bool,
+    amp_dtype: torch.dtype,
     grad_accum_steps: int,
     loss_weights: dict[str, float],
     verifier_crop_size: int,
@@ -121,7 +122,7 @@ def run_distillation_step(
 
     grounding_loss = GroundingLoss(lambda1=lambda1, lambda2=lambda2, lambda3=lambda3)
 
-    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
         outputs = model(images=images, token_ids=token_ids, attention_mask=attention_mask)
         consistency_maps: list[torch.Tensor] = [outputs["fused_tokens"]]
 
@@ -263,6 +264,7 @@ def run_phase2_finetune_step(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     use_amp: bool,
+    amp_dtype: torch.dtype,
     grad_accum_steps: int,
     lambda1: float,
     lambda3: float,
@@ -285,7 +287,7 @@ def run_phase2_finetune_step(
     augmented_phrases = batch.get("augmented_phrases")
     augmented_phrase_sets = list(augmented_phrases) if augmented_phrases is not None else None
 
-    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
         outputs = model(images=images, token_ids=token_ids, attention_mask=attention_mask)
         l_box = box_loss(outputs["bbox"], target_box)
 

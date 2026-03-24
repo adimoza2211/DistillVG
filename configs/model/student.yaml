@@ -1,3 +1,6 @@
+# Student architecture hyperparameters used in `StudentModel` init.
+# These define feature width, token budget, and proposal head capacity.
+# Changing them affects both compute cost and proposal quality.
 hidden_dim: 384
 fusion_layers: 4
 attention_heads: 6
@@ -6,6 +9,9 @@ tob_tokens: 150
 proposal_count: 200
 
 proposal_generator:
+  # Proposal generator backend settings.
+  # When enabled, YOLO26 proposals replace learned proposal-box output.
+  # Thresholds trade recall vs precision for proposal sampling.
   use_yolo26: true
   yolo26_model_cfg: ""
   yolo26_weights_path: ""

@@ -1,4 +1,7 @@
 defaults:
+  # Hydra composition for train entrypoint.
+  # Each file below is merged into one runtime config object.
+  # `scripts/train.py` consumes the merged object via `Trainer`.
   - data/dataloader
   - model/student
   - train/efficiency
@@ -13,26 +16,73 @@ lambda2: 1.0
 lambda3: 5.0
 
 training:
-  epochs: 30
-  steps_per_epoch: 12
-  micro_batch_size: 4
-  max_records: 0
+  # --- Core loop controls (maps to common train.sh flags) ---
+  # `batch_size_per_gpu` + `grad_accum_steps` + `num_gpus` define effective batch.
+  # `batches_per_epoch` limits batches consumed each epoch (0 = full dataloader pass).
+  epochs: 90
+  batches_per_epoch: 0
+  batch_size_per_gpu: 4
+  num_gpus: 1
+  gpu_ids: ""
+  max_train_records: 0
+
+  # --- Model/input sizing controls ---
+  # Image preprocessing keeps aspect ratio: longer edge -> `resize_long_edge`,
+  # then pads shorter edge with zeros to `padded_square_size`.
   hidden_dim: 256
-  image_size: 64
-  seq_len: 16
-  vocab_size: 1024
-  lr: 3.0e-4
+  resize_long_edge: 640
+  padded_square_size: 640
+  max_query_length: 40
+  text_vocab_size: 1024
+
+  # --- Optimizer base settings ---
+  # `lr` corresponds to base learning rate (like --lr in CLI scripts).
+  # Weight decay is applied through selected optimizer param groups.
+  lr: 1.0e-4
   weight_decay: 0.05
+
+  # --- Device policy ---
+  # `auto` picks cuda if available, else cpu.
+  # `auto_least_used`/`auto_max_free` picks visible GPU with most free VRAM.
+  # You can force a device explicitly, e.g. `cuda:1`.
   device: auto
 
 verifier:
+  # Online verifier runtime settings used during phase1 distillation.
+  # This block controls verifier backend/model loading and how stage1/stage2
+  # proposal scoring queries are built and executed per training step.
   backend: internvl
   model_id: OpenGVLab/InternVL3_5-8B
   image_root: data/datasets/other/images/mscoco/images/train2014
+  source_image_roots:
+    # Per-dataset image roots to resolve annotation filenames correctly.
+    # COCO-family datasets point to COCO train2014 root.
+    # ReferIt points to its own numeric-filename image directory.
+    referit: data/datasets/referit/images
+    unc: data/datasets/other/images/mscoco/images/train2014
+    unc+: data/datasets/other/images/mscoco/images/train2014
+    gref: data/datasets/other/images/mscoco/images/train2014
+    gref_umd: data/datasets/other/images/mscoco/images/train2014
+  source_image_styles:
+    # Filename interpretation per dataset source.
+    # `coco` converts numeric ids to `COCO_train2014_XXXXXXXXXXXX.jpg`.
+    # `referit` keeps direct numeric jpg naming (e.g., `10000.jpg`).
+    referit: referit
+    unc: coco
+    unc+: coco
+    gref: coco
+    gref_umd: coco
   mock_hidden_dim: 64
   crop_size: 64
   top_k_proposals: 16
   stage2_top_k: 5
   use_augmented_queries: true
   query_selection: first
+  # FlashAttention preference for InternVL load path.
+  # `auto` enables flash attention only when the package is installed.
+  # Set `true`/`false` to force behavior.
+  use_flash_attn: auto
+  # Glob for *_aug.pth files that provide grounding records/phrases.
+  # These records are loaded into the dataloader at startup.
+  # Empty matches will fail phase1 training by design.
   augmented_phrase_glob: data/annotations/*/*_aug.pth

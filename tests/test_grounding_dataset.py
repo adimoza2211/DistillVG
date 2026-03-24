@@ -45,9 +45,10 @@ def test_augmented_grounding_dataset_emits_phase1_sample(tmp_path: Path) -> None
     dataset = AugmentedGroundingDataset(
         records=records,
         image_root=str(image_root),
-        image_size=64,
-        seq_len=12,
-        vocab_size=256,
+        resize_long_edge=64,
+        padded_square_size=64,
+        max_query_length=12,
+        text_vocab_size=256,
     )
 
     sample = dataset[0]

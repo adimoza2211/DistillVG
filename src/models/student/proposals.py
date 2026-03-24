@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 import torch
+
+os.environ.setdefault("YOLO_AUTOINSTALL", "false")
+
 from ultralytics import YOLO
 
 
