@@ -198,15 +198,21 @@ class InternVLOnlineVerifier(BaseOnlineVerifier):
                 T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ]
         )
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        generation_common: dict[str, Any] = {
+            "do_sample": False,
+        }
+        if eos_token_id is not None:
+            generation_common["eos_token_id"] = int(eos_token_id)
+            generation_common["pad_token_id"] = int(eos_token_id)
+
         self.binary_generation_config: dict[str, Any] = {
             "max_new_tokens": 1,
-            "do_sample": False,
-            "temperature": 0.0,
+            **generation_common,
         }
         self.class_generation_config: dict[str, Any] = {
             "max_new_tokens": 2,
-            "do_sample": False,
-            "temperature": 0.0,
+            **generation_common,
         }
 
         device_map = getattr(self.model, "hf_device_map", None)

@@ -18,16 +18,16 @@ training:
   # --------------------------
 
   # Number of epochs and optional batch cap per epoch (0 = full dataloader pass).
-  epochs: 90
+  epochs: 30
   batches_per_epoch: 0
 
   # Micro-batch size loaded on each visible GPU.
-  batch_size_per_gpu: 4
+  batch_size_per_gpu: 16
 
   # Preferred way to control visible GPUs.
   # Example: "0,1" means GPU 0 and 1 are visible.
   # Leave empty to use all visible devices.
-  available_gpu_ids: ""
+  available_gpu_ids: "1"
 
   # Optional cap on training records for fast debugging (0 = all records).
   max_train_records: 0
@@ -69,6 +69,13 @@ data:
   num_workers: 8
   pin_memory: true
   persistent_workers: true
+
+  # Training dataset composition (original + augmented loaded together).
+  train_records_original_glob: data/annotations/*/*_train.pth
+  train_records_augmented_glob: data/annotations/*/*_train_aug.pth
+
+  # Validation records evaluated at the end of each epoch.
+  val_records_glob: data/annotations/*/*_val.pth
 
 model:
   # Student architecture capacity controls.
@@ -122,9 +129,6 @@ verifier:
   # auto  -> use if installed, otherwise fallback with warning
   use_flash_attn: true
 
-  # Glob for pre-generated *_aug.pth phrase/box records.
-  augmented_phrase_glob: data/annotations/*/*_aug.pth
-
 train:
   # -----------------
   # Runtime efficiency
@@ -132,8 +136,10 @@ train:
 
   amp: true
   amp_dtype: bf16
-  grad_accum_steps: 16
+  grad_accum_steps: 2
   grad_clip_norm: 0.1
+  # Log step-level progress every N batches.
+  log_interval: 5
 
   # ------------------
   # Training mode/opt
@@ -143,7 +149,7 @@ train:
   optimizer: musgd
 
   # Epoch-level LR decay scheduler settings.
-  lr_decay_epoch: 40
+  lr_decay_epoch: 20
   lr_decay_gamma: 0.1
 
   # Freeze text encoder for first N phase1 epochs.
@@ -177,3 +183,8 @@ train:
   lambda_l1: 5.0
   lambda_giou: 2.0
   lambda_ver: 1.0
+
+  # Checkpointing and crash-safe resume.
+  checkpoint_dir: outputs/checkpoints
+  resume: false
+  resume_checkpoint_path: ""

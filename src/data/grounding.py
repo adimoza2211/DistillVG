@@ -19,7 +19,7 @@ class GroundingSample:
     attention_mask: torch.Tensor
     target_box: torch.Tensor
     phrase: str
-    augmented_phrases: tuple[str, ...]
+    source: str
 
 
 @dataclass(frozen=True)
@@ -67,29 +67,41 @@ def _normalize_phrase(text: str) -> str:
     return " ".join(text.strip().split())
 
 
-def _record_from_tuple(item: tuple[object, ...]) -> GroundingRecord | None:
+def _record_from_tuple(item: tuple[object, ...]) -> list[GroundingRecord]:
+    """Parse tuple and expand into one record per phrase (for augmented phrases)."""
     if len(item) < 4:
-        return None
+        return []
     image_name = item[0]
     box_xywh = item[2]
-    phrase_list = item[3]
+    phrase_field = item[3]
 
     if not isinstance(image_name, str):
-        return None
+        return []
     if not isinstance(box_xywh, list) or len(box_xywh) != 4:
-        return None
-    if not isinstance(phrase_list, list) or not all(isinstance(value, str) for value in phrase_list):
-        return None
+        return []
+    
+    phrases: list[str] = []
+    if isinstance(phrase_field, str):
+        normalized = _normalize_phrase(phrase_field)
+        if normalized:
+            phrases.append(normalized)
+    elif isinstance(phrase_field, list) and all(isinstance(value, str) for value in phrase_field):
+        phrases = [_normalize_phrase(value) for value in phrase_field if _normalize_phrase(value)]
+    else:
+        return []
 
-    normalized_phrases = tuple(_normalize_phrase(value) for value in phrase_list if _normalize_phrase(value))
-    if not normalized_phrases:
-        return None
+    if not phrases:
+        return []
 
-    return GroundingRecord(
-        image_name=image_name,
-        box_xywh=(float(box_xywh[0]), float(box_xywh[1]), float(box_xywh[2]), float(box_xywh[3])),
-        phrases=normalized_phrases,
-    )
+    records = [
+        GroundingRecord(
+            image_name=image_name,
+            box_xywh=(float(box_xywh[0]), float(box_xywh[1]), float(box_xywh[2]), float(box_xywh[3])),
+            phrases=(phrase,),  # Single phrase per record
+        )
+        for phrase in phrases
+    ]
+    return records
 
 
 def load_grounding_records(pattern: str) -> list[GroundingRecord]:
@@ -108,8 +120,8 @@ def load_grounding_records(pattern: str) -> list[GroundingRecord]:
         for item in payload:
             if not isinstance(item, tuple):
                 continue
-            record = _record_from_tuple(item)
-            if record is not None:
+            expanded_records = _record_from_tuple(item)
+            for record in expanded_records:
                 records.append(
                     GroundingRecord(
                         image_name=record.image_name,
@@ -220,5 +232,5 @@ class AugmentedGroundingDataset(Dataset[GroundingSample]):
             attention_mask=attention_mask,
             target_box=target_box,
             phrase=phrase,
-            augmented_phrases=record.phrases,
+            source=record.source,
         )

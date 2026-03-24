@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import time
 from collections import Counter
+from datetime import timedelta
+from pathlib import Path
 
 import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from torchvision.ops import box_iou
 
 from src.data.collate import collate_grounding_batch
 from src.data.grounding import AugmentedGroundingDataset, GroundingRecord, load_grounding_records
@@ -91,14 +94,27 @@ class Trainer:
         weights = [1.0 / float(source_counts[record.source]) for record in records]
         return torch.tensor(weights, dtype=torch.double)
 
+    @staticmethod
+    def _load_records_from_patterns(patterns: list[str]) -> list[GroundingRecord]:
+        records: list[GroundingRecord] = []
+        for pattern in patterns:
+            normalized = pattern.strip()
+            if not normalized:
+                continue
+            records.extend(load_grounding_records(pattern=normalized))
+        return records
+
     def _build_dataloader(self) -> DataLoader:
         training_cfg = self.cfg.training
-        phrase_bank_pattern = str(self.cfg.verifier.augmented_phrase_glob)
-        records = load_grounding_records(pattern=phrase_bank_pattern)
+        train_patterns = [
+            str(getattr(self.cfg.data, "train_records_original_glob", "")).strip(),
+            str(getattr(self.cfg.data, "train_records_augmented_glob", "")).strip(),
+        ]
+        records = self._load_records_from_patterns(train_patterns)
         if not records:
             raise RuntimeError(
-                f"No augmented grounding records matched pattern: {phrase_bank_pattern}. "
-                "Phase 1 requires real _aug.pth-backed training data."
+                "No training grounding records were loaded from configured train patterns. "
+                "Set data.train_records_original_glob / data.train_records_augmented_glob to valid paths."
             )
 
         max_records = int(getattr(training_cfg, "max_records", 0))
@@ -106,7 +122,7 @@ class Trainer:
         if max_records > 0:
             records = records[:max_records]
 
-        self.logger.info("Loaded %d grounding records from pattern: %s", len(records), phrase_bank_pattern)
+        self.logger.info("Loaded %d training grounding records from patterns: %s", len(records), train_patterns)
 
         dataset = AugmentedGroundingDataset(
             records=records,
@@ -141,6 +157,169 @@ class Trainer:
             collate_fn=collate_grounding_batch,
             drop_last=False,
         )
+
+    def _build_validation_dataloader(self) -> DataLoader:
+        val_pattern = str(getattr(self.cfg.data, "val_records_glob", "")).strip()
+        if not val_pattern:
+            raise RuntimeError("data.val_records_glob must be set for per-epoch validation.")
+
+        records = load_grounding_records(pattern=val_pattern)
+        if not records:
+            raise RuntimeError(f"No validation grounding records matched pattern: {val_pattern}")
+
+        self.logger.info("Loaded %d validation grounding records from pattern: %s", len(records), val_pattern)
+
+        dataset = AugmentedGroundingDataset(
+            records=records,
+            image_root=str(self.cfg.verifier.image_root),
+            resize_long_edge=int(self.cfg.training.resize_long_edge),
+            padded_square_size=int(self.cfg.training.padded_square_size),
+            max_query_length=int(self.cfg.training.max_query_length),
+            text_vocab_size=int(self.cfg.training.text_vocab_size),
+            source_image_roots={
+                str(key): str(value)
+                for key, value in getattr(self.cfg.verifier, "source_image_roots", {}).items()
+            },
+            source_image_styles={
+                str(key): str(value)
+                for key, value in getattr(self.cfg.verifier, "source_image_styles", {}).items()
+            },
+        )
+
+        return DataLoader(
+            dataset,
+            batch_size=int(self.cfg.training.batch_size_per_gpu),
+            shuffle=False,
+            num_workers=int(self.cfg.data.num_workers),
+            pin_memory=bool(self.cfg.data.pin_memory),
+            persistent_workers=bool(self.cfg.data.persistent_workers),
+            collate_fn=collate_grounding_batch,
+            drop_last=False,
+        )
+
+    @staticmethod
+    def _checkpoint_dir(cfg: DictConfig) -> Path:
+        configured = str(getattr(cfg.train, "checkpoint_dir", "checkpoints")).strip()
+        return Path(configured)
+
+    def _save_checkpoint(
+        self,
+        *,
+        model: StudentModel,
+        optimizer: torch.optim.Optimizer,
+        scaler: torch.amp.GradScaler,
+        scheduler: torch.optim.lr_scheduler.StepLR | None,
+        epoch_index: int,
+        global_step: int,
+        best_val_acc: float,
+        latest_path: Path,
+        best_path: Path,
+        is_best: bool,
+    ) -> None:
+        latest_path.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "epoch": int(epoch_index),
+            "global_step": int(global_step),
+            "best_val_acc": float(best_val_acc),
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+        }
+        torch.save(state, latest_path)
+        if is_best:
+            torch.save(state, best_path)
+
+    def _try_resume(
+        self,
+        *,
+        model: StudentModel,
+        optimizer: torch.optim.Optimizer,
+        scaler: torch.amp.GradScaler,
+        scheduler: torch.optim.lr_scheduler.StepLR | None,
+    ) -> tuple[int, int, float]:
+        resume_enabled = bool(getattr(self.cfg.train, "resume", False))
+        if not resume_enabled:
+            return 0, 0, float("-inf")
+
+        checkpoint_path = str(getattr(self.cfg.train, "resume_checkpoint_path", "")).strip()
+        if not checkpoint_path:
+            raise RuntimeError("train.resume=true but train.resume_checkpoint_path is empty.")
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scaler_state = checkpoint.get("scaler_state_dict")
+        if isinstance(scaler_state, dict):
+            scaler.load_state_dict(scaler_state)
+        scheduler_state = checkpoint.get("scheduler_state_dict")
+        if scheduler is not None and isinstance(scheduler_state, dict):
+            scheduler.load_state_dict(scheduler_state)
+
+        start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        global_step = int(checkpoint.get("global_step", 0))
+        best_val_acc = float(checkpoint.get("best_val_acc", float("-inf")))
+        self.logger.info(
+            "Resumed training from checkpoint %s | start_epoch=%d | global_step=%d | best_val_acc=%.6f",
+            checkpoint_path,
+            start_epoch,
+            global_step,
+            best_val_acc,
+        )
+        return start_epoch, global_step, best_val_acc
+
+    def _run_validation_epoch(self, model: StudentModel, dataloader: DataLoader, epoch_index: int) -> tuple[float, float, dict[str, float]]:
+        model.eval()
+        total = 0
+        acc_hits = 0
+        iou_sum = 0.0
+        source_hits: Counter[str] = Counter()
+        source_total: Counter[str] = Counter()
+
+        with torch.no_grad():
+            for batch in dataloader:
+                images = batch["images"].to(self.device, non_blocking=True)
+                token_ids = batch["token_ids"].to(self.device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
+                target_box = batch["target_box"].to(self.device, non_blocking=True)
+                sources = list(batch.get("sources", []))
+
+                outputs = model(images=images, token_ids=token_ids, attention_mask=attention_mask)
+                pred_box = outputs["bbox"].detach()
+
+                iou_matrix = box_iou(pred_box, target_box)
+                ious = iou_matrix.diagonal()
+                hits = (ious >= 0.5)
+
+                batch_size = int(ious.shape[0])
+                total += batch_size
+                acc_hits += int(hits.sum().item())
+                iou_sum += float(ious.sum().item())
+
+                for idx in range(batch_size):
+                    source_name = sources[idx] if idx < len(sources) else "unknown"
+                    source_total[source_name] += 1
+                    if bool(hits[idx].item()):
+                        source_hits[source_name] += 1
+
+        overall_acc = (float(acc_hits) / float(total)) if total > 0 else 0.0
+        mean_iou = (float(iou_sum) / float(total)) if total > 0 else 0.0
+        per_source_acc = {
+            source: (float(source_hits[source]) / float(count)) if count > 0 else 0.0
+            for source, count in source_total.items()
+        }
+
+        self.logger.info(
+            "Validation Epoch %d | acc@0.5=%.6f | mean_iou=%.6f | samples=%d",
+            epoch_index + 1,
+            overall_acc,
+            mean_iou,
+            total,
+        )
+        if per_source_acc:
+            self.logger.info("Validation per-source acc@0.5 | %s", per_source_acc)
+
+        return overall_acc, mean_iou, per_source_acc
 
     def _build_model(self) -> StudentModel:
         training_cfg = self.cfg.training
@@ -258,12 +437,14 @@ class Trainer:
         mode = self._train_mode()
         online_verifier = self._build_online_verifier() if mode == "phase1" else None
         dataloader = self._build_dataloader()
+        val_dataloader = self._build_validation_dataloader()
         optimizer = self._build_optimizer(model)
 
         use_amp = bool(self.cfg.train.amp) and self.device.type == "cuda"
         amp_dtype = self._resolve_amp_dtype(str(getattr(self.cfg.train, "amp_dtype", "bf16")))
         grad_accum_steps = int(self.cfg.train.grad_accum_steps)
         grad_clip_norm = float(self.cfg.train.grad_clip_norm)
+        log_interval = int(getattr(self.cfg.train, "log_interval", 50))
         use_grad_scaler = use_amp and amp_dtype == torch.float16
         scaler = torch.amp.GradScaler(device=self.device.type, enabled=use_grad_scaler)
         loss_weights = self._loss_weights()
@@ -292,13 +473,26 @@ class Trainer:
 
         model.train()
         start_time = time.time()
-        global_step = 0
+        checkpoint_dir = self._checkpoint_dir(self.cfg)
+        latest_checkpoint_path = checkpoint_dir / "latest_pretrain.pt"
+        best_checkpoint_path = checkpoint_dir / "best_pretrain.pt"
 
-        for epoch in range(int(self.cfg.training.epochs)):
+        start_epoch, global_step, best_val_acc = self._try_resume(
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            scheduler=scheduler,
+        )
+
+        for epoch in range(start_epoch, int(self.cfg.training.epochs)):
             self._apply_epoch_trainability(model, epoch)
             optimizer.zero_grad(set_to_none=True)
             metrics = self._epoch_metrics_template()
             processed_steps = 0
+            iter_time_total = 0.0
+            data_time_total = 0.0
+            epoch_total_steps = len(dataloader) if batches_per_epoch <= 0 else min(len(dataloader), batches_per_epoch)
+            end = time.time()
 
             if self.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(self.device)
@@ -307,6 +501,8 @@ class Trainer:
                 if batches_per_epoch > 0 and step > batches_per_epoch:
                     break
                 processed_steps += 1
+                data_time = time.time() - end
+                iter_start = time.time()
 
                 losses = run_distillation_step(
                     model=model,
@@ -375,6 +571,44 @@ class Trainer:
                 metrics["giou"] += float(losses.giou.detach().cpu().item())
                 metrics["ver"] += float(losses.ver.detach().cpu().item())
 
+                iter_time = time.time() - iter_start
+                iter_time_total += iter_time
+                data_time_total += data_time
+
+                should_log_progress = (step % max(log_interval, 1) == 0) or (step == epoch_total_steps)
+                if should_log_progress:
+                    avg_iter_time = iter_time_total / max(processed_steps, 1)
+                    avg_data_time = data_time_total / max(processed_steps, 1)
+                    remaining_steps = max(epoch_total_steps - step, 0)
+                    eta = str(timedelta(seconds=int(avg_iter_time * remaining_steps)))
+                    current_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+                    lr_value = max(current_lrs) if current_lrs else 0.0
+                    max_mem = 0.0
+                    if self.device.type == "cuda":
+                        max_mem = float(torch.cuda.max_memory_allocated(self.device) / (1024 ** 2))
+
+                    self.logger.info(
+                        "Epoch: [%d]  [%d/%d]  eta: %s  lr: %.6f  loss: %.4f (%.4f)  l1: %.4f (%.4f)  giou: %.4f (%.4f)  ver: %.4f (%.4f)  time: %.4f  data: %.4f  max mem: %.0f",
+                        epoch + 1,
+                        step,
+                        epoch_total_steps,
+                        eta,
+                        lr_value,
+                        float(losses.total.detach().cpu().item()),
+                        metrics["total"] / max(processed_steps, 1),
+                        float(losses.l1.detach().cpu().item()),
+                        metrics["l1"] / max(processed_steps, 1),
+                        float(losses.giou.detach().cpu().item()),
+                        metrics["giou"] / max(processed_steps, 1),
+                        float(losses.ver.detach().cpu().item()),
+                        metrics["ver"] / max(processed_steps, 1),
+                        avg_iter_time,
+                        avg_data_time,
+                        max_mem,
+                    )
+
+                end = time.time()
+
             if processed_steps > 0 and processed_steps % grad_accum_steps != 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
@@ -383,8 +617,7 @@ class Trainer:
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-            denom = batches_per_epoch if batches_per_epoch > 0 else len(dataloader)
-            denom = max(denom, 1)
+            denom = max(processed_steps, 1)
             avg_loss = metrics["total"] / denom
             peak_gpu_memory = 0.0
             if self.device.type == "cuda":
@@ -407,6 +640,35 @@ class Trainer:
                 max_lr,
                 peak_gpu_memory,
                 "amp" if use_amp else "fp32",
+            )
+
+            val_acc, val_mean_iou, _ = self._run_validation_epoch(model, val_dataloader, epoch)
+            self._apply_epoch_trainability(model, epoch)
+
+            is_best = val_acc > best_val_acc
+            if is_best:
+                best_val_acc = val_acc
+
+            self._save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                scheduler=scheduler,
+                epoch_index=epoch,
+                global_step=global_step,
+                best_val_acc=best_val_acc,
+                latest_path=latest_checkpoint_path,
+                best_path=best_checkpoint_path,
+                is_best=is_best,
+            )
+            self.logger.info(
+                "Checkpointed epoch %d | latest=%s | best=%s | val_acc=%.6f | val_mean_iou=%.6f | best_val_acc=%.6f",
+                epoch + 1,
+                latest_checkpoint_path,
+                best_checkpoint_path,
+                val_acc,
+                val_mean_iou,
+                best_val_acc,
             )
 
         total_time = time.time() - start_time

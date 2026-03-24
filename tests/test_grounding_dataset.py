@@ -22,10 +22,13 @@ def test_load_grounding_records_from_augmented_payload(tmp_path: Path) -> None:
     torch.save(payload, path)
 
     records = load_grounding_records(str(tmp_path / "*_aug.pth"))
-    assert len(records) == 1
+    assert len(records) == 2, "Augmented phrases should be expanded into separate records"
     assert records[0].image_name == "COCO_train2014_000000000009.jpg"
-    assert records[0].phrases == ("phrase one", "phrase two")
+    assert records[0].phrases == ("phrase one",), "First record has first augmented phrase"
+    assert records[1].image_name == "COCO_train2014_000000000009.jpg"
+    assert records[1].phrases == ("phrase two",), "Second record has second augmented phrase"
     assert records[0].source == tmp_path.name
+    assert records[1].source == tmp_path.name
 
 
 def test_augmented_grounding_dataset_emits_phase1_sample(tmp_path: Path) -> None:
@@ -38,7 +41,7 @@ def test_augmented_grounding_dataset_emits_phase1_sample(tmp_path: Path) -> None
         GroundingRecord(
             image_name="COCO_train2014_000000000009.jpg",
             box_xywh=(10.0, 5.0, 30.0, 20.0),
-            phrases=("small object", "tiny object"),
+            phrases=("small object",),
             source="synthetic",
         )
     ]
@@ -57,7 +60,6 @@ def test_augmented_grounding_dataset_emits_phase1_sample(tmp_path: Path) -> None
     assert sample.attention_mask.shape == (12,)
     assert sample.target_box.shape == (4,)
     assert sample.phrase == "small object"
-    assert sample.augmented_phrases == ("small object", "tiny object")
     assert torch.all(sample.target_box >= 0.0)
     assert torch.all(sample.target_box <= 1.0)
 
