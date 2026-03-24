@@ -28,10 +28,16 @@ def _resize_spatial_tokens(tokens: torch.Tensor, target_tokens: int) -> torch.Te
         return tokens
 
     source_h, source_w = _factorize_target_tokens(source_tokens)
-
     target_h, target_w = _factorize_target_tokens(target_tokens)
     feature_map = tokens.transpose(1, 2).reshape(batch_size, hidden_dim, source_h, source_w)
-    resized = F.adaptive_avg_pool2d(feature_map, output_size=(target_h, target_w))
+
+    if target_tokens > source_tokens:
+        # Upsampling — use bilinear interpolation for smooth features.
+        resized = F.interpolate(feature_map, size=(target_h, target_w), mode="bilinear", align_corners=False)
+    else:
+        # Downsampling — adaptive_avg_pool2d is efficient and correct.
+        resized = F.adaptive_avg_pool2d(feature_map, output_size=(target_h, target_w))
+
     return resized.flatten(2).transpose(1, 2)
 
 

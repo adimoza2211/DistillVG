@@ -13,6 +13,7 @@ from torchvision.ops import box_iou
 from src.data.collate import collate_grounding_batch
 from src.data.grounding import AugmentedGroundingDataset, GroundingRecord, load_grounding_records
 from src.models.student.model import StudentModel
+from src.models.student.text_encoder import StudentTextEncoder
 from src.training.optimizers import MuSGD
 from src.models.verifier.runtime import BaseOnlineVerifier, build_online_verifier
 from src.training.distill import run_distillation_step, run_phase2_finetune_step
@@ -26,6 +27,19 @@ class Trainer:
         self.logger = get_logger("distillvg.trainer")
         self.device = self._resolve_device()
         set_seed(int(self.cfg.seed), deterministic=False)
+
+        # Initialize CLIP tokenizer from MobileCLIP.
+        text_encoder_model = str(getattr(self.cfg.model, "text_encoder_model", "mobileclip_s1"))
+        self._clip_tokenizer = StudentTextEncoder.get_tokenizer(text_encoder_model)
+
+    def _tokenize_fn(self, phrase: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tokenize a phrase using the CLIP BPE tokenizer."""
+        token_ids = self._clip_tokenizer([phrase]).squeeze(0)  # [77]
+        # CLIP tokenizer uses 0 as padding and encodes SOT/EOT tokens.
+        attention_mask = (token_ids != 0).long()
+        if int(attention_mask.sum().item()) == 0:
+            attention_mask[0] = 1
+        return token_ids, attention_mask
 
     @staticmethod
     def _parse_gpu_id_count(gpu_ids: str) -> int:
@@ -75,13 +89,6 @@ class Trainer:
             return max(torch.cuda.device_count(), 1)
         return 1
 
-    def _loss_weights(self) -> dict[str, float]:
-        return {
-            "lambda_l1": float(self.cfg.train.lambda_l1),
-            "lambda_giou": float(self.cfg.train.lambda_giou),
-            "lambda_ver": float(self.cfg.train.lambda_ver),
-        }
-
     def _train_mode(self) -> str:
         mode = str(getattr(self.cfg.train, "mode", "phase1")).strip().lower()
         if mode not in {"phase1", "phase2_strict"}:
@@ -104,7 +111,32 @@ class Trainer:
             records.extend(load_grounding_records(pattern=normalized))
         return records
 
-    def _build_dataloader(self) -> DataLoader:
+    def _load_precomputed_cache(self) -> dict | None:
+        """Load precomputed YOLO proposals and verifier targets from disk."""
+        cache_path = str(getattr(self.cfg.train, "precomputed_cache_path", "")).strip()
+        if not cache_path:
+            return None
+
+        path = Path(cache_path)
+        if not path.exists():
+            self.logger.warning(
+                "Precomputed cache path configured but file not found: %s. Falling back to online mode.",
+                cache_path,
+            )
+            return None
+
+        self.logger.info("Loading precomputed cache from %s", cache_path)
+        cache = torch.load(cache_path, weights_only=False)
+        proposals_count = len(cache.get("proposals", {}))
+        targets_count = len(cache.get("targets", {}))
+        self.logger.info(
+            "Loaded precomputed cache: %d proposal sets, %d verifier target sets",
+            proposals_count,
+            targets_count,
+        )
+        return cache
+
+    def _build_dataloader(self, precomputed_cache: dict | None = None) -> DataLoader:
         training_cfg = self.cfg.training
         train_patterns = [
             str(getattr(self.cfg.data, "train_records_original_glob", "")).strip(),
@@ -129,8 +161,7 @@ class Trainer:
             image_root=str(self.cfg.verifier.image_root),
             resize_long_edge=int(training_cfg.resize_long_edge),
             padded_square_size=int(training_cfg.padded_square_size),
-            max_query_length=int(training_cfg.max_query_length),
-            text_vocab_size=int(training_cfg.text_vocab_size),
+            tokenize_fn=self._tokenize_fn,
             source_image_roots={
                 str(key): str(value)
                 for key, value in getattr(self.cfg.verifier, "source_image_roots", {}).items()
@@ -139,6 +170,7 @@ class Trainer:
                 str(key): str(value)
                 for key, value in getattr(self.cfg.verifier, "source_image_styles", {}).items()
             },
+            precomputed_cache=precomputed_cache,
         )
         sample_weights = self._compute_sampling_weights(records)
         sampler = WeightedRandomSampler(
@@ -174,8 +206,7 @@ class Trainer:
             image_root=str(self.cfg.verifier.image_root),
             resize_long_edge=int(self.cfg.training.resize_long_edge),
             padded_square_size=int(self.cfg.training.padded_square_size),
-            max_query_length=int(self.cfg.training.max_query_length),
-            text_vocab_size=int(self.cfg.training.text_vocab_size),
+            tokenize_fn=self._tokenize_fn,
             source_image_roots={
                 str(key): str(value)
                 for key, value in getattr(self.cfg.verifier, "source_image_roots", {}).items()
@@ -323,11 +354,12 @@ class Trainer:
 
     def _build_model(self) -> StudentModel:
         training_cfg = self.cfg.training
+        text_encoder_model = str(getattr(self.cfg.model, "text_encoder_model", "mobileclip_s1"))
+        text_encoder_pretrained = str(getattr(self.cfg.model, "text_encoder_pretrained", "")).strip() or None
         model = StudentModel(
             hidden_dim=int(training_cfg.hidden_dim),
             fusion_layers=int(self.cfg.model.fusion_layers),
             attention_heads=int(self.cfg.model.attention_heads),
-            vocab_size=int(training_cfg.text_vocab_size),
             roi_tokens=int(self.cfg.model.roi_tokens),
             tob_tokens=int(self.cfg.model.tob_tokens),
             proposal_count=int(self.cfg.model.proposal_count),
@@ -336,6 +368,8 @@ class Trainer:
             yolo26_weights_path=str(self.cfg.model.proposal_generator.yolo26_weights_path),
             yolo26_conf_threshold=float(self.cfg.model.proposal_generator.yolo26_conf_threshold),
             yolo26_iou_threshold=float(self.cfg.model.proposal_generator.yolo26_iou_threshold),
+            text_encoder_model_name=text_encoder_model,
+            text_encoder_pretrained=text_encoder_pretrained,
         )
         for parameter in model.backbone.parameters():
             parameter.requires_grad = False
@@ -348,14 +382,26 @@ class Trainer:
         base_lr = float(training_cfg.lr)
         text_lr = base_lr * 0.1
         mode = self._train_mode()
+        use_yolo = bool(self.cfg.model.proposal_generator.use_yolo26)
+
+        # Only include proposal_bbox_head when it's actually used (no YOLO).
+        head_params = (
+            list(model.bbox_head.parameters())
+            + list(model.verifier.parameters())
+        )
+        if not use_yolo:
+            head_params += list(model.proposal_bbox_head.parameters())
+
+        # Include backbone projection layer (trainable even though backbone is frozen).
+        backbone_proj_params = []
+        if model.backbone.proj is not None:
+            backbone_proj_params = list(model.backbone.proj.parameters())
+
         if mode == "phase2_strict":
             trainable_groups: list[dict[str, object]] = [
-                {"params": list(model.backbone.parameters()), "lr": base_lr * 0.1},
+                {"params": backbone_proj_params, "lr": base_lr * 0.1},
                 {
-                    "params": list(model.fusion.parameters())
-                    + list(model.bbox_head.parameters())
-                    + list(model.proposal_bbox_head.parameters())
-                    + list(model.verifier.parameters()),
+                    "params": list(model.fusion.parameters()) + head_params,
                     "lr": base_lr,
                 },
                 {"params": list(model.text_encoder.parameters()), "lr": base_lr},
@@ -363,10 +409,7 @@ class Trainer:
         else:
             trainable_groups = [
             {
-                "params": list(model.fusion.parameters())
-                + list(model.bbox_head.parameters())
-                + list(model.proposal_bbox_head.parameters())
-                + list(model.verifier.parameters()),
+                "params": list(model.fusion.parameters()) + head_params + backbone_proj_params,
                 "lr": base_lr,
             },
             {"params": list(model.text_encoder.parameters()), "lr": text_lr},
@@ -433,10 +476,24 @@ class Trainer:
         }
 
     def train(self) -> None:
-        model = self._build_model()
         mode = self._train_mode()
-        online_verifier = self._build_online_verifier() if mode == "phase1" else None
-        dataloader = self._build_dataloader()
+
+        # Load precomputed cache (YOLO proposals + verifier targets).
+        precomputed_cache = self._load_precomputed_cache()
+        has_precomputed = precomputed_cache is not None
+
+        model = self._build_model()
+
+        # Only build the online verifier if we need it (phase1 without precomputed targets).
+        online_verifier: BaseOnlineVerifier | None = None
+        if mode == "phase1" and not has_precomputed:
+            online_verifier = self._build_online_verifier()
+        elif mode == "phase1" and has_precomputed:
+            self.logger.info(
+                "Precomputed cache loaded — skipping online verifier build (saves ~5GB GPU memory)."
+            )
+
+        dataloader = self._build_dataloader(precomputed_cache=precomputed_cache)
         val_dataloader = self._build_validation_dataloader()
         optimizer = self._build_optimizer(model)
 
@@ -447,7 +504,6 @@ class Trainer:
         log_interval = int(getattr(self.cfg.train, "log_interval", 50))
         use_grad_scaler = use_amp and amp_dtype == torch.float16
         scaler = torch.amp.GradScaler(device=self.device.type, enabled=use_grad_scaler)
-        loss_weights = self._loss_weights()
         batches_per_epoch = int(getattr(self.cfg.training, "batches_per_epoch", 0))
 
         lr_decay_epoch = int(getattr(self.cfg.train, "lr_decay_epoch", 0))
@@ -459,7 +515,7 @@ class Trainer:
         num_gpus = self._num_gpus_for_batch_math()
         effective_batch_size = int(self.cfg.training.batch_size_per_gpu) * grad_accum_steps * num_gpus
         self.logger.info(
-            "Starting train | experiment=%s | device=%s | amp=%s | amp_dtype=%s | per_gpu_batch=%d | grad_accum=%d | num_gpus=%d | effective_batch=%d | synthetic_scaffold=%s",
+            "Starting train | experiment=%s | device=%s | amp=%s | amp_dtype=%s | per_gpu_batch=%d | grad_accum=%d | num_gpus=%d | effective_batch=%d | precomputed=%s",
             self.cfg.experiment,
             self.device,
             use_amp,
@@ -468,7 +524,7 @@ class Trainer:
             grad_accum_steps,
             num_gpus,
             effective_batch_size,
-            False,
+            has_precomputed,
         )
 
         model.train()
@@ -506,14 +562,13 @@ class Trainer:
 
                 losses = run_distillation_step(
                     model=model,
-                    online_verifier=online_verifier,  # type: ignore[arg-type]
+                    online_verifier=online_verifier,
                     batch=batch,
                     scaler=scaler,
                     device=self.device,
                     use_amp=use_amp,
                     amp_dtype=amp_dtype,
                     grad_accum_steps=grad_accum_steps,
-                    loss_weights=loss_weights,
                     verifier_crop_size=int(self.cfg.verifier.crop_size),
                     verifier_top_k_proposals=int(self.cfg.verifier.top_k_proposals),
                     verifier_stage2_top_k=int(self.cfg.verifier.stage2_top_k),
@@ -546,7 +601,7 @@ class Trainer:
                     grad_accum_steps=grad_accum_steps,
                     lambda1=float(self.cfg.lambda1),
                     lambda3=float(self.cfg.lambda3),
-                    vocab_size=int(self.cfg.training.text_vocab_size),
+                    tokenize_fn=self._tokenize_fn,
                     epoch_index=epoch,
                     total_epochs=int(self.cfg.training.epochs),
                     stal_enabled=bool(self.cfg.train.stal.enabled),

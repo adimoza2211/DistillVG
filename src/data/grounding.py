@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 from glob import glob
-import hashlib
 from pathlib import Path
 import re
 
@@ -20,6 +20,9 @@ class GroundingSample:
     target_box: torch.Tensor
     phrase: str
     source: str
+    precomputed_proposals: torch.Tensor | None = None
+    precomputed_verifier_targets: torch.Tensor | None = None
+    precomputed_verifier_mask: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -49,18 +52,8 @@ def _resolve_coco_name(image_name: str) -> str:
     return f"COCO_train2014_{numeric_id:012d}.jpg"
 
 
-def _encode_phrase_to_ids(phrase: str, seq_len: int, vocab_size: int) -> torch.Tensor:
-    token_ids = torch.zeros(seq_len, dtype=torch.long)
-    if vocab_size <= 1:
-        return token_ids
-
-    token_space = vocab_size - 1
-    words = phrase.lower().split()
-    for index, word in enumerate(words[:seq_len]):
-        digest = hashlib.blake2b(word.encode("utf-8"), digest_size=8).digest()
-        stable_hash = int.from_bytes(digest, byteorder="little", signed=False)
-        token_ids[index] = 1 + (stable_hash % token_space)
-    return token_ids
+# TokenizeFn signature: (phrase: str) -> tuple[token_ids: Tensor, attention_mask: Tensor]
+TokenizeFn = Callable[[str], tuple[torch.Tensor, torch.Tensor]]
 
 
 def _normalize_phrase(text: str) -> str:
@@ -141,10 +134,10 @@ class AugmentedGroundingDataset(Dataset[GroundingSample]):
         image_root: str,
         resize_long_edge: int,
         padded_square_size: int,
-        max_query_length: int,
-        text_vocab_size: int,
+        tokenize_fn: TokenizeFn,
         source_image_roots: dict[str, str] | None = None,
         source_image_styles: dict[str, str] | None = None,
+        precomputed_cache: dict | None = None,
     ) -> None:
         super().__init__()
         if not records:
@@ -154,11 +147,19 @@ class AugmentedGroundingDataset(Dataset[GroundingSample]):
         self.image_root = Path(image_root)
         self.source_image_roots = {key: Path(value) for key, value in (source_image_roots or {}).items()}
         self.source_image_styles = {key: value.lower() for key, value in (source_image_styles or {}).items()}
-        self.max_query_length = int(max_query_length)
-        self.text_vocab_size = int(text_vocab_size)
+        self.tokenize_fn = tokenize_fn
         self.resize_long_edge = int(resize_long_edge)
         self.padded_square_size = int(padded_square_size)
         self.to_tensor = transforms.ToTensor()
+
+        # Precomputed data caches (populated by precompute_targets.py).
+        self._proposals_cache: dict[str, torch.Tensor] = {}
+        self._targets_cache: dict[tuple[str, str], torch.Tensor] = {}
+        self._masks_cache: dict[tuple[str, str], torch.Tensor] = {}
+        if precomputed_cache is not None:
+            self._proposals_cache = precomputed_cache.get("proposals", {})
+            self._targets_cache = precomputed_cache.get("targets", {})
+            self._masks_cache = precomputed_cache.get("masks", {})
 
     def __len__(self) -> int:
         return len(self.records)
@@ -217,14 +218,13 @@ class AugmentedGroundingDataset(Dataset[GroundingSample]):
         )
 
         phrase = record.phrases[0]
-        token_ids = _encode_phrase_to_ids(
-            phrase=phrase,
-            seq_len=self.max_query_length,
-            vocab_size=self.text_vocab_size,
-        )
-        attention_mask = (token_ids != 0).long()
-        if int(attention_mask.sum().item()) == 0:
-            attention_mask[0] = 1
+        token_ids, attention_mask = self.tokenize_fn(phrase)
+
+        # Lookup precomputed data if available.
+        precomputed_proposals = self._proposals_cache.get(record.image_name)
+        cache_key = (record.image_name, phrase)
+        precomputed_targets = self._targets_cache.get(cache_key)
+        precomputed_mask = self._masks_cache.get(cache_key)
 
         return GroundingSample(
             image=image_tensor,
@@ -233,4 +233,7 @@ class AugmentedGroundingDataset(Dataset[GroundingSample]):
             target_box=target_box,
             phrase=phrase,
             source=record.source,
+            precomputed_proposals=precomputed_proposals,
+            precomputed_verifier_targets=precomputed_targets,
+            precomputed_verifier_mask=precomputed_mask,
         )

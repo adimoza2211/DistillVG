@@ -109,44 +109,6 @@ class BaseOnlineVerifier(nn.Module, ABC):
         raise NotImplementedError
 
 
-class MockOnlineVerifier(BaseOnlineVerifier):
-    def __init__(self, hidden_dim: int = 64) -> None:
-        super().__init__()
-        generator = torch.Generator().manual_seed(17)
-        image_proj = torch.randn(3, hidden_dim, generator=generator) / math.sqrt(3.0)
-        text_proj = torch.randn(2, hidden_dim, generator=generator) / math.sqrt(2.0)
-        self.register_buffer("image_proj", image_proj)
-        self.register_buffer("text_proj", text_proj)
-
-    def forward(self, crops: torch.Tensor, queries: list[str]) -> torch.Tensor:
-        if len(queries) != crops.shape[0]:
-            raise ValueError("Verifier query count must match crop batch size.")
-
-        pooled_images = crops.mean(dim=(2, 3))
-        query_lens = torch.tensor([len(query.split()) for query in queries], device=crops.device, dtype=crops.dtype)
-        query_chars = torch.tensor([len(query) for query in queries], device=crops.device, dtype=crops.dtype)
-        text_stats = torch.stack([query_lens, query_chars.sqrt()], dim=-1)
-
-        image_features = pooled_images @ self.image_proj
-        text_features = text_stats @ self.text_proj
-        logits = (image_features * text_features).sum(dim=-1) / math.sqrt(float(image_features.shape[-1]))
-        return logits
-
-    def score_4class(self, images: torch.Tensor, queries: list[str]) -> torch.Tensor:
-        binary = self.forward(images, queries)
-        p = torch.sigmoid(binary)
-        labels = torch.stack(
-            [
-                0.7 * p + 0.01 * (1.0 - p),
-                0.2 * p + 0.04 * (1.0 - p),
-                0.08 * p + 0.15 * (1.0 - p),
-                0.02 * p + 0.80 * (1.0 - p),
-            ],
-            dim=-1,
-        )
-        return torch.log(labels.clamp_min(1e-6))
-
-
 class InternVLOnlineVerifier(BaseOnlineVerifier):
     def __init__(self, model_id: str, device: torch.device, use_flash_attn: str | bool = "auto") -> None:
         super().__init__()
@@ -286,16 +248,14 @@ def _freeze_verifier(verifier: BaseOnlineVerifier) -> BaseOnlineVerifier:
 
 def build_online_verifier(cfg: DictConfig, device: torch.device) -> BaseOnlineVerifier:
     backend = str(cfg.backend).lower()
-    if backend == "mock":
-        verifier = MockOnlineVerifier(hidden_dim=int(cfg.mock_hidden_dim))
-    elif backend == "internvl":
+    if backend == "internvl":
         verifier = InternVLOnlineVerifier(
             model_id=str(cfg.model_id),
             device=device,
             use_flash_attn=getattr(cfg, "use_flash_attn", "auto"),
         )
     else:
-        raise ValueError(f"Unsupported verifier backend: {cfg.backend}")
+        raise ValueError(f"Unsupported verifier backend: {cfg.backend}. Only 'internvl' is supported.")
 
     verifier = _freeze_verifier(verifier)
     return verifier.to(device)

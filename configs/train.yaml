@@ -43,9 +43,8 @@ training:
   resize_long_edge: 640
   padded_square_size: 640
 
-  # Text tokenization limits for the lightweight text encoder.
-  max_query_length: 40
-  text_vocab_size: 1024
+  # CLIP context length (MobileCLIP BPE tokenizer, 77 tokens).
+  max_query_length: 77
 
   # -----------------
   # Optimizer defaults
@@ -82,6 +81,10 @@ model:
   fusion_layers: 6
   attention_heads: 8
 
+  # Text encoder: MobileCLIP-S1 pretrained CLIP text encoder.
+  text_encoder_model: mobileclip_s1
+  text_encoder_pretrained: ""  # Path to mobileclip_s1.pt checkpoint, empty = random init.
+
   # Visual token budgets.
   roi_tokens: 300
   tob_tokens: 200
@@ -116,7 +119,6 @@ verifier:
     gref: coco
     gref_umd: coco
 
-  mock_hidden_dim: 64
   crop_size: 64
   top_k_proposals: 16
   stage2_top_k: 5
@@ -148,6 +150,11 @@ train:
   mode: phase1
   optimizer: musgd
 
+  # Path to precomputed YOLO proposals + verifier targets cache.
+  # Empty = online mode (runs verifier every step).
+  # Set to a .pt file produced by scripts/precompute_targets.py for fast training.
+  precomputed_cache_path: ""
+
   # Epoch-level LR decay scheduler settings.
   lr_decay_epoch: 20
   lr_decay_gamma: 0.1
@@ -178,11 +185,6 @@ train:
     verifier_start_scale: 1.1
     verifier_end_scale: 0.9
     power: 1.0
-
-  # Static loss weights used by Trainer._loss_weights().
-  lambda_l1: 5.0
-  lambda_giou: 2.0
-  lambda_ver: 1.0
 
   # Checkpointing and crash-safe resume.
   checkpoint_dir: outputs/checkpoints
