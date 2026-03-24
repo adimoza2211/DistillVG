@@ -121,33 +121,12 @@ def run_distillation_step(
     attention_mask = batch["attention_mask"].to(device, non_blocking=True)
     target_box = batch["target_box"].to(device, non_blocking=True)
     phrases = list(batch.get("phrases", []))
-    augmented_phrases = batch.get("augmented_phrases")
-    if augmented_phrases is None:
-        augmented_phrase_sets: list[tuple[str, ...]] | None = None
-    else:
-        augmented_phrase_sets = list(augmented_phrases)
 
     grounding_loss = GroundingLoss(lambda1=lambda1, lambda2=lambda2, lambda3=lambda3)
 
     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
         outputs = model(images=images, token_ids=token_ids, attention_mask=attention_mask)
         consistency_maps: list[torch.Tensor] = [outputs["fused_tokens"]]
-
-        maybe_augmented_inputs = _build_augmented_inputs(
-            phrases=phrases,
-            augmented_phrase_sets=augmented_phrase_sets,
-            seq_len=token_ids.shape[1],
-            vocab_size=int(model.text_encoder.embedding.num_embeddings),
-            device=device,
-        )
-        if maybe_augmented_inputs is not None:
-            augmented_token_ids, augmented_attention_mask = maybe_augmented_inputs
-            augmented_outputs = model(
-                images=images,
-                token_ids=augmented_token_ids,
-                attention_mask=augmented_attention_mask,
-            )
-            consistency_maps.append(augmented_outputs["fused_tokens"])
         if bool(getattr(model, "use_yolo26_proposals", False)):
             proposal_boxes = normalize_xyxy_boxes(outputs["proposal_boxes"].detach())
         else:
@@ -176,14 +155,8 @@ def run_distillation_step(
             stage1_scores = stage1_scores.reshape(images.shape[0], stage1_k)
             stage2_top_k = max(1, min(verifier_stage2_top_k, stage1_k))
             top_stage2_indices = stage1_scores.topk(stage2_top_k, dim=-1).indices
-            highlighted = draw_highlighted_proposals(
-                images=images.detach(),
-                proposal_boxes=proposal_boxes_stage1,
-                top_indices=top_stage2_indices,
-                thickness=3,
-            )
             stage2_queries = build_stage2_verifier_queries(verifier_queries, top_k=stage2_top_k)
-            stage2_logits = online_verifier.score_4class(images=highlighted, queries=stage2_queries)
+            stage2_logits = online_verifier.score_4class(images=images, queries=stage2_queries)
             stage2_soft = torch.softmax(stage2_logits, dim=-1).reshape(images.shape[0], stage2_top_k, 4)
 
             verifier_targets, verifier_mask = build_verifier_targets(
