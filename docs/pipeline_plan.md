@@ -4,7 +4,7 @@
 
 ## System Architecture
 
-The overarching goal is to achieve sub-30ms mobile inference (Apple Neural Engine / CoreML / ONNX) while retaining state-of-the-art visual grounding from massive VLM teachers. The system structure is strictly divided into Student pathways and Teacher (Verifier) pathways during Phase 1 training, decoupling into a pure Student topology for later stages.
+The overarching goal is to achieve sub-30ms mobile inference (Apple Neural Engine / CoreML / ONNX) while retaining state-of-the-art visual grounding (RefCOCO/+/g and Referit datasets) from massive VLM teachers. The system structure is strictly divided into Student pathways and Teacher (Verifier) pathways during Phase 1 training, decoupling into a pure Student topology for later stages.
 
 ### 1. The Student Topology
 The student model must be highly compact but conceptually rich:

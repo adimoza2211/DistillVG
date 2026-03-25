@@ -7,10 +7,16 @@ defaults:
 experiment: student_full
 seed: 42
 
-# Top-level combined loss coefficients used in the training loop.
+# Top-level loss coefficients (backward-compat aliases).
 lambda1: 0.1
 lambda2: 1.0
 lambda3: 8.0
+
+# New dual-branch loss coefficients.
+lambda_box: 5.0
+lambda_dwbd: 2.0
+lambda_align: 1.0
+lambda_cst: 0.1
 
 training:
   # --------------------------
@@ -37,7 +43,7 @@ training:
   # -----------------
 
   # Shared hidden width for student projections and fusion.
-  hidden_dim: 512
+  hidden_dim: 384
 
   # Resize long edge and then pad to square size.
   resize_long_edge: 640
@@ -78,22 +84,25 @@ data:
 
 model:
   # Student architecture capacity controls.
-  fusion_layers: 6
+  num_encoder_layers: 4
+  num_decoder_layers: 3
   attention_heads: 8
+  num_decoder_queries: 1
+  ffn_dim: 1536
+  dropout: 0.1
+
+  # Multi-scale visual token spatial sizes for P3, P4, P5.
+  visual_spatial_sizes:
+    - [10, 10]
+    - [7, 7]
+    - [5, 5]
 
   # Text encoder: MobileCLIP-S1 pretrained CLIP text encoder.
   text_encoder_model: mobileclip_s1
   text_encoder_pretrained: ""  # Path to mobileclip_s1.pt checkpoint, empty = random init.
 
-  # Visual token budgets.
-  roi_tokens: 300
-  tob_tokens: 200
-
-  # Proposal budget consumed by verifier ranking and final selection.
-  proposal_count: 300
-
   proposal_generator:
-    # If true, YOLO26 proposals are used instead of learned proposal boxes.
+    # YOLO26 backbone is used for FPN feature extraction (not proposals).
     use_yolo26: true
     yolo26_model_cfg: ""
     yolo26_weights_path: ""
@@ -148,7 +157,7 @@ train:
   # ------------------
 
   mode: phase1
-  optimizer: musgd
+  optimizer: adamw
 
   # Path to precomputed YOLO proposals + verifier targets cache.
   # Empty = online mode (runs verifier every step).
@@ -161,11 +170,8 @@ train:
 
   # Freeze text encoder for first N phase1 epochs.
   freeze_text_encoder_epochs: 10
-
-  musgd:
-    momentum: 0.95
-    muon_beta: 0.95
-    eps: 1.0e-8
+  # Freeze backbone projections for first N phase1 epochs.
+  freeze_backbone_epochs: 15
 
   dwbd:
     enabled: true

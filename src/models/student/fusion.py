@@ -1,148 +1,187 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 
-def _factorize_target_tokens(target_tokens: int) -> tuple[int, int]:
-    if target_tokens <= 0:
-        raise ValueError("target_tokens must be > 0")
+class _EncoderLayer(nn.Module):
+    """Pre-norm encoder layer: visual tokens cross-attend to text, then self-attend."""
 
-    best_h = 1
-    best_w = target_tokens
-    best_gap = abs(best_w - best_h)
-    for height in range(1, int(target_tokens**0.5) + 1):
-        if target_tokens % height != 0:
-            continue
-        width = target_tokens // height
-        gap = abs(width - height)
-        if gap < best_gap:
-            best_h, best_w, best_gap = height, width, gap
-    return best_h, best_w
+    def __init__(self, hidden_dim: int, num_heads: int, ffn_dim: int, dropout: float) -> None:
+        super().__init__()
+        # Cross-attention: visual queries, text keys/values.
+        self.norm_cross = nn.LayerNorm(hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim, num_heads=num_heads,
+            dropout=dropout, batch_first=True,
+        )
+        # Self-attention on visual tokens.
+        self.norm_self = nn.LayerNorm(hidden_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim, num_heads=num_heads,
+            dropout=dropout, batch_first=True,
+        )
+        # FFN.
+        self.norm_ffn = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        visual: torch.Tensor,
+        text: torch.Tensor,
+        text_key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Cross-attention (pre-norm).
+        v = self.norm_cross(visual)
+        cross_out, _ = self.cross_attn(
+            query=v, key=text, value=text,
+            key_padding_mask=text_key_padding_mask,
+            need_weights=False,
+        )
+        visual = visual + cross_out
+
+        # Self-attention (pre-norm).
+        v = self.norm_self(visual)
+        self_out, _ = self.self_attn(
+            query=v, key=v, value=v,
+            need_weights=False,
+        )
+        visual = visual + self_out
+
+        # FFN (pre-norm).
+        visual = visual + self.ffn(self.norm_ffn(visual))
+        return visual
 
 
-def _resize_spatial_tokens(tokens: torch.Tensor, target_tokens: int) -> torch.Tensor:
-    batch_size, source_tokens, hidden_dim = tokens.shape
-    if source_tokens == target_tokens:
-        return tokens
+class _DecoderLayer(nn.Module):
+    """Pre-norm decoder layer: queries self-attend, then cross-attend to memory."""
 
-    source_h, source_w = _factorize_target_tokens(source_tokens)
-    target_h, target_w = _factorize_target_tokens(target_tokens)
-    feature_map = tokens.transpose(1, 2).reshape(batch_size, hidden_dim, source_h, source_w)
+    def __init__(self, hidden_dim: int, num_heads: int, ffn_dim: int, dropout: float) -> None:
+        super().__init__()
+        # Self-attention on queries.
+        self.norm_self = nn.LayerNorm(hidden_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim, num_heads=num_heads,
+            dropout=dropout, batch_first=True,
+        )
+        # Cross-attention: queries attend to encoder memory.
+        self.norm_cross = nn.LayerNorm(hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim, num_heads=num_heads,
+            dropout=dropout, batch_first=True,
+        )
+        # FFN.
+        self.norm_ffn = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, hidden_dim),
+            nn.Dropout(dropout),
+        )
 
-    if target_tokens > source_tokens:
-        # Upsampling — use bilinear interpolation for smooth features.
-        resized = F.interpolate(feature_map, size=(target_h, target_w), mode="bilinear", align_corners=False)
-    else:
-        # Downsampling — adaptive_avg_pool2d is efficient and correct.
-        resized = F.adaptive_avg_pool2d(feature_map, output_size=(target_h, target_w))
+    def forward(self, queries: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        # Self-attention (pre-norm).
+        q = self.norm_self(queries)
+        self_out, _ = self.self_attn(
+            query=q, key=q, value=q,
+            need_weights=False,
+        )
+        queries = queries + self_out
 
-    return resized.flatten(2).transpose(1, 2)
+        # Cross-attention to encoder memory (pre-norm).
+        q = self.norm_cross(queries)
+        cross_out, _ = self.cross_attn(
+            query=q, key=memory, value=memory,
+            need_weights=False,
+        )
+        queries = queries + cross_out
+
+        # FFN (pre-norm).
+        queries = queries + self.ffn(self.norm_ffn(queries))
+        return queries
 
 
-class FusionTransformer(nn.Module):
+class FusionEncoderDecoder(nn.Module):
+    """Encoder-decoder fusion transformer for visual grounding.
+
+    Encoder: Visual tokens cross-attend to text tokens, producing
+    text-conditioned visual features (memory).
+
+    Decoder: Object queries (from TQG module) cross-attend to encoder
+    memory, self-attend, then FFN. Standard DETR decoder pattern.
+
+    Args:
+        hidden_dim: Model dimensionality.
+        num_encoder_layers: Number of encoder layers.
+        num_decoder_layers: Number of decoder layers.
+        num_heads: Number of attention heads.
+        ffn_dim: FFN intermediate dimensionality.
+        dropout: Dropout rate.
+    """
+
     def __init__(
         self,
-        hidden_dim: int,
-        target_tokens: int,
-        num_layers: int,
-        attention_heads: int,
+        hidden_dim: int = 384,
+        num_encoder_layers: int = 4,
+        num_decoder_layers: int = 3,
+        num_heads: int = 8,
+        ffn_dim: int = 1536,
+        dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        if num_layers <= 0:
-            raise ValueError("num_layers must be > 0")
-        if attention_heads <= 0:
-            raise ValueError("attention_heads must be > 0")
-        if hidden_dim % attention_heads != 0:
-            raise ValueError("hidden_dim must be divisible by attention_heads")
+        if hidden_dim % num_heads != 0:
+            raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}")
 
-        self.input_norm = nn.LayerNorm(hidden_dim)
-        self.cross_attention = nn.ModuleList(
-            [
-                nn.MultiheadAttention(
-                    embed_dim=hidden_dim,
-                    num_heads=attention_heads,
-                    dropout=0.0,
-                    batch_first=True,
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        self.self_attention = nn.ModuleList(
-            [
-                nn.MultiheadAttention(
-                    embed_dim=hidden_dim,
-                    num_heads=attention_heads,
-                    dropout=0.0,
-                    batch_first=True,
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        self.norm_after_cross = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
-        self.norm_after_self = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
-        self.norm_after_mlp = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
-        self.mlp = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim * 4),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim * 4, hidden_dim),
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        self.target_tokens = target_tokens
+        self.encoder_layers = nn.ModuleList([
+            _EncoderLayer(hidden_dim, num_heads, ffn_dim, dropout)
+            for _ in range(num_encoder_layers)
+        ])
+        self.encoder_norm = nn.LayerNorm(hidden_dim)
+
+        self.decoder_layers = nn.ModuleList([
+            _DecoderLayer(hidden_dim, num_heads, ffn_dim, dropout)
+            for _ in range(num_decoder_layers)
+        ])
+        self.decoder_norm = nn.LayerNorm(hidden_dim)
 
     def forward(
         self,
         visual_tokens: torch.Tensor,
         text_tokens: torch.Tensor,
-        text_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if text_mask is None:
-            text_mask = torch.ones(
-                text_tokens.shape[0],
-                text_tokens.shape[1],
-                dtype=torch.bool,
-                device=text_tokens.device,
-            )
-        else:
-            text_mask = text_mask.to(dtype=torch.bool)
+        text_mask: torch.Tensor,
+        queries: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run encoder-decoder fusion.
 
-        empty_rows = ~text_mask.any(dim=1)
-        if empty_rows.any():
-            text_mask = text_mask.clone()
-            text_mask[empty_rows, 0] = True
+        Args:
+            visual_tokens: [B, N_vis, hidden_dim] — multi-scale visual tokens.
+            text_tokens: [B, N_text, hidden_dim] — text token embeddings.
+            text_mask: [B, N_text] — boolean mask (True = real token).
+            queries: [B, N_queries, hidden_dim] — text-guided object queries.
 
-        weights = text_mask.unsqueeze(-1).to(text_tokens.dtype)
-        denominator = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
-        text_context = (text_tokens * weights).sum(dim=1, keepdim=True) / denominator
+        Returns:
+            decoded: [B, N_queries, hidden_dim] — decoded object representations.
+            memory: [B, N_vis, hidden_dim] — encoder output (text-conditioned visual features).
+        """
+        text_key_padding_mask = ~text_mask.bool() if text_mask.dtype != torch.bool else ~text_mask
 
-        fused = self.input_norm(visual_tokens + text_context)
-        key_padding_mask = ~text_mask
-        for layer_idx in range(len(self.cross_attention)):
-            cross_output, _ = self.cross_attention[layer_idx](
-                query=fused,
-                key=text_tokens,
-                value=text_tokens,
-                key_padding_mask=key_padding_mask,
-                need_weights=False,
-            )
-            fused = self.norm_after_cross[layer_idx](fused + cross_output)
+        # Encoder: visual ← cross-attend → text.
+        memory = visual_tokens
+        for layer in self.encoder_layers:
+            memory = layer(memory, text_tokens, text_key_padding_mask)
+        memory = self.encoder_norm(memory)
 
-            self_output, _ = self.self_attention[layer_idx](
-                query=fused,
-                key=fused,
-                value=fused,
-                need_weights=False,
-            )
-            fused = self.norm_after_self[layer_idx](fused + self_output)
+        # Decoder: queries ← cross-attend → memory.
+        decoded = queries
+        for layer in self.decoder_layers:
+            decoded = layer(decoded, memory)
+        decoded = self.decoder_norm(decoded)
 
-            mlp_output = self.mlp[layer_idx](fused)
-            fused = self.norm_after_mlp[layer_idx](fused + mlp_output)
-
-        if fused.shape[1] != self.target_tokens:
-            fused = _resize_spatial_tokens(fused, self.target_tokens)
-        return fused
+        return decoded, memory

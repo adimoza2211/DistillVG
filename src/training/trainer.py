@@ -316,7 +316,7 @@ class Trainer:
                 sources = list(batch.get("sources", []))
 
                 outputs = model(images=images, token_ids=token_ids, attention_mask=attention_mask)
-                pred_box = outputs["bbox"].detach()
+                pred_box = outputs["decoder_bbox"].detach()
 
                 iou_matrix = box_iou(pred_box, target_box)
                 ious = iou_matrix.diagonal()
@@ -356,14 +356,21 @@ class Trainer:
         training_cfg = self.cfg.training
         text_encoder_model = str(getattr(self.cfg.model, "text_encoder_model", "mobileclip_s1"))
         text_encoder_pretrained = str(getattr(self.cfg.model, "text_encoder_pretrained", "")).strip() or None
+
+        # Parse visual spatial sizes from config (list of [h, w] pairs).
+        raw_sizes = getattr(self.cfg.model, "visual_spatial_sizes", [[10, 10], [7, 7], [5, 5]])
+        spatial_sizes = tuple(tuple(s) for s in raw_sizes)
+
         model = StudentModel(
             hidden_dim=int(training_cfg.hidden_dim),
-            fusion_layers=int(self.cfg.model.fusion_layers),
+            num_encoder_layers=int(getattr(self.cfg.model, "num_encoder_layers", 4)),
+            num_decoder_layers=int(getattr(self.cfg.model, "num_decoder_layers", 3)),
             attention_heads=int(self.cfg.model.attention_heads),
-            roi_tokens=int(self.cfg.model.roi_tokens),
-            tob_tokens=int(self.cfg.model.tob_tokens),
-            proposal_count=int(self.cfg.model.proposal_count),
-            use_yolo26_proposals=bool(self.cfg.model.proposal_generator.use_yolo26),
+            num_decoder_queries=int(getattr(self.cfg.model, "num_decoder_queries", 1)),
+            visual_spatial_sizes=spatial_sizes,
+            ffn_dim=int(getattr(self.cfg.model, "ffn_dim", int(training_cfg.hidden_dim) * 4)),
+            dropout=float(getattr(self.cfg.model, "dropout", 0.1)),
+            use_yolo26=bool(self.cfg.model.proposal_generator.use_yolo26),
             yolo26_model_cfg=str(self.cfg.model.proposal_generator.yolo26_model_cfg),
             yolo26_weights_path=str(self.cfg.model.proposal_generator.yolo26_weights_path),
             yolo26_conf_threshold=float(self.cfg.model.proposal_generator.yolo26_conf_threshold),
@@ -382,38 +389,42 @@ class Trainer:
         base_lr = float(training_cfg.lr)
         text_lr = base_lr * 0.1
         mode = self._train_mode()
-        use_yolo = bool(self.cfg.model.proposal_generator.use_yolo26)
 
-        # Only include proposal_bbox_head when it's actually used (no YOLO).
+        # Collect all head parameters.
         head_params = (
-            list(model.bbox_head.parameters())
-            + list(model.verifier.parameters())
+            list(model.decoder_bbox_head.parameters())
+            + list(model.mlp_bbox_head.parameters())
+            + list(model.text_gate.parameters())
+            + list(model.alignment_head.parameters())
         )
-        if not use_yolo:
-            head_params += list(model.proposal_bbox_head.parameters())
 
-        # Include backbone projection layer (trainable even though backbone is frozen).
+        # Backbone projection parameters (always trained).
         backbone_proj_params = []
-        if model.backbone.proj is not None:
-            backbone_proj_params = list(model.backbone.proj.parameters())
+        if model.backbone.projs is not None:
+            backbone_proj_params = list(model.backbone.projs.parameters())
+        backbone_proj_params += list(model.backbone.scale_embed.parameters())
+
+        # Query generation parameters.
+        query_gen_params = list(model.query_gen.parameters())
 
         if mode == "phase2_strict":
             trainable_groups: list[dict[str, object]] = [
                 {"params": backbone_proj_params, "lr": base_lr * 0.1},
                 {
-                    "params": list(model.fusion.parameters()) + head_params,
+                    "params": list(model.fusion.parameters()) + query_gen_params + head_params,
                     "lr": base_lr,
                 },
                 {"params": list(model.text_encoder.parameters()), "lr": base_lr},
             ]
         else:
             trainable_groups = [
-            {
-                "params": list(model.fusion.parameters()) + head_params + backbone_proj_params,
-                "lr": base_lr,
-            },
-            {"params": list(model.text_encoder.parameters()), "lr": text_lr},
+                {
+                    "params": list(model.fusion.parameters()) + query_gen_params + head_params + backbone_proj_params,
+                    "lr": base_lr,
+                },
+                {"params": list(model.text_encoder.parameters()), "lr": text_lr},
             ]
+
         optimizer_name = str(self.cfg.train.optimizer).lower()
         if optimizer_name == "musgd":
             optimizer = MuSGD(
@@ -436,22 +447,28 @@ class Trainer:
 
     def _apply_epoch_trainability(self, model: StudentModel, epoch_index: int) -> None:
         mode = self._train_mode()
-        freeze_text_epochs = int(getattr(self.cfg.train, "freeze_text_encoder_epochs", 5))
+        freeze_text_epochs = int(getattr(self.cfg.train, "freeze_text_encoder_epochs", 10))
+        freeze_backbone_epochs = int(getattr(self.cfg.train, "freeze_backbone_epochs", 15))
+
         if mode == "phase2_strict":
-            model.backbone.train()
-            model.text_encoder.train()
-            model.fusion.train()
-            model.bbox_head.train()
-            model.proposal_bbox_head.train()
-            model.verifier.train()
+            model.train()
             for parameter in model.parameters():
                 parameter.requires_grad = True
             return
 
+        # YOLO backbone: always in eval mode, but projections can be unfrozen.
         model.backbone.eval()
-        for parameter in model.backbone.parameters():
-            parameter.requires_grad = False
+        if model.backbone.yolo_pt_model is not None:
+            for parameter in model.backbone.yolo_pt_model.parameters():
+                parameter.requires_grad = False
+        # Unfreeze backbone projections after freeze_backbone_epochs.
+        if model.backbone.projs is not None:
+            for parameter in model.backbone.projs.parameters():
+                parameter.requires_grad = (epoch_index >= freeze_backbone_epochs)
+        for parameter in model.backbone.scale_embed.parameters():
+            parameter.requires_grad = True
 
+        # Text encoder unfreezing schedule.
         if epoch_index < freeze_text_epochs:
             model.text_encoder.eval()
             for parameter in model.text_encoder.parameters():
@@ -461,10 +478,13 @@ class Trainer:
             for parameter in model.text_encoder.parameters():
                 parameter.requires_grad = True
 
+        # Fusion, query gen, and heads are always trainable.
         model.fusion.train()
-        model.bbox_head.train()
-        model.proposal_bbox_head.train()
-        model.verifier.train()
+        model.query_gen.train()
+        model.decoder_bbox_head.train()
+        model.mlp_bbox_head.train()
+        model.text_gate.train()
+        model.alignment_head.train()
 
     @staticmethod
     def _epoch_metrics_template() -> dict[str, float]:
@@ -569,16 +589,12 @@ class Trainer:
                     use_amp=use_amp,
                     amp_dtype=amp_dtype,
                     grad_accum_steps=grad_accum_steps,
-                    verifier_crop_size=int(self.cfg.verifier.crop_size),
-                    verifier_top_k_proposals=int(self.cfg.verifier.top_k_proposals),
-                    verifier_stage2_top_k=int(self.cfg.verifier.stage2_top_k),
-                    use_augmented_verifier_queries=bool(self.cfg.verifier.use_augmented_queries),
-                    verifier_query_selection=str(self.cfg.verifier.query_selection),
                     epoch_index=epoch,
                     total_epochs=int(self.cfg.training.epochs),
-                    lambda1=float(self.cfg.lambda1),
-                    lambda2=float(self.cfg.lambda2),
-                    lambda3=float(self.cfg.lambda3),
+                    lambda_box=float(getattr(self.cfg, "lambda_box", self.cfg.lambda3)),
+                    lambda_dwbd=float(getattr(self.cfg, "lambda_dwbd", self.cfg.lambda2)),
+                    lambda_align=float(getattr(self.cfg, "lambda_align", self.cfg.lambda1)),
+                    lambda_cst=float(getattr(self.cfg, "lambda_cst", 0.1)),
                     dwbd_alpha_max=float(self.cfg.train.dwbd.alpha_max),
                     dwbd_alpha_min=float(self.cfg.train.dwbd.alpha_min),
                     dwbd_gamma=float(self.cfg.train.dwbd.gamma),
@@ -588,8 +604,6 @@ class Trainer:
                     progloss_enabled=bool(self.cfg.train.progloss.enabled),
                     progloss_box_start=float(self.cfg.train.progloss.box_start_scale),
                     progloss_box_end=float(self.cfg.train.progloss.box_end_scale),
-                    progloss_verifier_start=float(self.cfg.train.progloss.verifier_start_scale),
-                    progloss_verifier_end=float(self.cfg.train.progloss.verifier_end_scale),
                     progloss_power=float(self.cfg.train.progloss.power),
                 ) if mode == "phase1" else run_phase2_finetune_step(
                     model=model,
@@ -599,8 +613,8 @@ class Trainer:
                     use_amp=use_amp,
                     amp_dtype=amp_dtype,
                     grad_accum_steps=grad_accum_steps,
-                    lambda1=float(self.cfg.lambda1),
-                    lambda3=float(self.cfg.lambda3),
+                    lambda_box=float(getattr(self.cfg, "lambda_box", self.cfg.lambda3)),
+                    lambda_dwbd=float(getattr(self.cfg, "lambda_dwbd", self.cfg.lambda2)),
                     tokenize_fn=self._tokenize_fn,
                     epoch_index=epoch,
                     total_epochs=int(self.cfg.training.epochs),

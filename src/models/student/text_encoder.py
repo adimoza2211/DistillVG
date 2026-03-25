@@ -15,6 +15,7 @@ class StudentTextEncoder(nn.Module):
 
     def __init__(
         self,
+        hidden_dim: int,
         model_name: str = "mobileclip_s1",
         pretrained: str | None = None,
     ) -> None:
@@ -33,6 +34,9 @@ class StudentTextEncoder(nn.Module):
         # Delete the image encoder to save memory — we only need text.
         del clip_model.image_encoder
         del clip_model
+
+        # Project native CLIP features (e.g. 512) to student's hidden dim (e.g. 64).
+        self.proj = nn.Linear(self.projection_dim, hidden_dim)
 
     @property
     def output_dim(self) -> int:
